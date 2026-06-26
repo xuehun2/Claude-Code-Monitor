@@ -30,16 +30,16 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(service);
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("claudeCodeMonitor.showDashboard", () => {
+    vscode.commands.registerCommand("claudeMonitor.showDashboard", () => {
       dashboard.show(service?.state);
     }),
-    vscode.commands.registerCommand("claudeCodeMonitor.selectSession", async () => {
+    vscode.commands.registerCommand("claudeMonitor.selectSession", async () => {
       await service?.pickSession();
     }),
-    vscode.commands.registerCommand("claudeCodeMonitor.openTranscript", () => {
+    vscode.commands.registerCommand("claudeMonitor.openTranscript", () => {
       service?.openTranscript();
     }),
-    vscode.commands.registerCommand("claudeCodeMonitor.refresh", () => {
+    vscode.commands.registerCommand("claudeMonitor.refresh", () => {
       service?.forceRefresh();
     })
   );
@@ -90,7 +90,7 @@ class MonitorService implements vscode.Disposable {
 
     this.disposables.push(
       vscode.workspace.onDidChangeConfiguration((e) => {
-        if (e.affectsConfiguration("claudeCodeMonitor")) {
+        if (e.affectsConfiguration("claudeMonitor")) {
           this.projectsDir = resolveProjectsDir(
             getConfig().get<string>("projectsDir")
           );
@@ -196,13 +196,13 @@ class MonitorService implements vscode.Disposable {
       let v = this.views.get(a.sessionId);
       if (!v) {
         const statusItem = vscode.window.createStatusBarItem(
-          `claudeCodeMonitor.${a.sessionId}`,
+          `claudeMonitor.${a.sessionId}`,
           vscode.StatusBarAlignment.Right,
           100
         );
         statusItem.name = `Claude Code: ${a.sessionId.slice(0, 8)}`;
         statusItem.command = {
-          command: "claudeCodeMonitor.showDashboard",
+          command: "claudeMonitor.showDashboard",
           arguments: [a.sessionId],
           title: "Show Dashboard",
         };
@@ -333,7 +333,7 @@ class MonitorService implements vscode.Disposable {
 }
 
 function getConfig(): vscode.WorkspaceConfiguration {
-  return vscode.workspace.getConfiguration("claudeCodeMonitor");
+  return vscode.workspace.getConfiguration("claudeMonitor");
 }
 
 /** Truncate a session title to 5 chars + "…" (by character count, not bytes). */

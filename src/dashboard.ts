@@ -3,7 +3,7 @@ import type { MonitorState } from "./metrics";
 import { fmtMs, fmtRate, fmtTokens } from "./metrics";
 
 export class Dashboard {
-  public static readonly viewType = "claudeCodeMonitor.dashboard";
+  public static readonly viewType = "claudeMonitor.dashboard";
   private panel: vscode.WebviewPanel | undefined;
   private readonly extUri: vscode.Uri;
   private lastState: MonitorState | undefined;

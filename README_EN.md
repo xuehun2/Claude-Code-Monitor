@@ -35,7 +35,7 @@ A VS Code extension that provides a **live status bar + dashboard** for [Claude 
 
 ## 🖥️ Dashboard
 
-Click the status bar or run `Claude Code: Show Live Dashboard` to open the webview panel with:
+Click the status bar or run `Claude Monitor: Show Live Dashboard` to open the webview panel with:
 
 - Real-time status cards (model / context progress bar / request duration / output rate / live timer)
 - Rate sparkline
@@ -72,22 +72,22 @@ Each live Claude Code process writes a JSON file (with sessionId, pid, cwd). The
 
 | Command | Description |
 | --- | --- |
-| `Claude Code: Show Live Dashboard` | Open the webview panel |
-| `Claude Code: Select Session to Monitor` | Pick a session to monitor |
-| `Claude Code: Open Transcript File` | Open the raw JSONL transcript |
-| `Claude Code: Refresh Now` | Force a re-read |
+| `Claude Monitor: Show Live Dashboard` | Open the webview panel |
+| `Claude Monitor: Select Session to Monitor` | Pick a session to monitor |
+| `Claude Monitor: Open Transcript File` | Open the raw JSONL transcript |
+| `Claude Monitor: Refresh Now` | Force a re-read |
 
 ## 🔧 Configuration
 
 | Key | Default | Description |
 | --- | --- | --- |
-| `claudeCodeMonitor.projectsDir` | `""` (auto-detect) | Override Claude Code projects directory |
-| `claudeCodeMonitor.contextLimit` | `200000` | Context window size for percentage calculation |
-| `claudeCodeMonitor.refreshIntervalMs` | `1000` | Poll interval (ms) |
-| `claudeCodeMonitor.retryThresholdMs` | `30000` | Legacy threshold (deprecated; retry detection now log-driven) |
-| `claudeCodeMonitor.statusBarAlignment` | `"right"` | Status bar alignment: `left` or `right` |
-| `claudeCodeMonitor.showInStatusBar` | `true` | Show the status bar item |
-| `claudeCodeMonitor.maxHistoryRequests` | `40` | Recent requests kept for dashboard |
+| `claudeMonitor.projectsDir` | `""` (auto-detect) | Override Claude Code projects directory |
+| `claudeMonitor.contextLimit` | `200000` | Context window size for percentage calculation |
+| `claudeMonitor.refreshIntervalMs` | `1000` | Poll interval (ms) |
+| `claudeMonitor.retryThresholdMs` | `30000` | Legacy threshold (deprecated; retry detection now log-driven) |
+| `claudeMonitor.statusBarAlignment` | `"right"` | Status bar alignment: `left` or `right` |
+| `claudeMonitor.showInStatusBar` | `true` | Show the status bar item |
+| `claudeMonitor.maxHistoryRequests` | `40` | Recent requests kept for dashboard |
 
 ## 🔨 Build from Source
 

@@ -1,6 +1,6 @@
 {
-  "name": "claude-code-monitor",
-  "displayName": "Claude Code Monitor",
+  "name": "claude-monitor",
+  "displayName": "Claude Monitor",
   "description": "🇨🇳 Claude Code 实时状态栏监控 | 🇬🇧 Real-time status bar monitor for Claude Code — model, context, rate, TTFT, retry detection, multi-session",
   "version": "0.1.0",
   "publisher": "xuehun",
@@ -21,63 +21,63 @@
   "contributes": {
     "commands": [
       {
-        "command": "claudeCodeMonitor.showDashboard",
-        "title": "Claude Code: Show Live Dashboard",
-        "category": "Claude Code Monitor"
+        "command": "claudeMonitor.showDashboard",
+        "title": "Claude Monitor: Show Live Dashboard",
+        "category": "Claude Monitor"
       },
       {
-        "command": "claudeCodeMonitor.selectSession",
-        "title": "Claude Code: Select Session to Monitor",
-        "category": "Claude Code Monitor"
+        "command": "claudeMonitor.selectSession",
+        "title": "Claude Monitor: Select Session to Monitor",
+        "category": "Claude Monitor"
       },
       {
-        "command": "claudeCodeMonitor.openTranscript",
-        "title": "Claude Code: Open Transcript File",
-        "category": "Claude Code Monitor"
+        "command": "claudeMonitor.openTranscript",
+        "title": "Claude Monitor: Open Transcript File",
+        "category": "Claude Monitor"
       },
       {
-        "command": "claudeCodeMonitor.refresh",
-        "title": "Claude Code: Refresh Now",
-        "category": "Claude Code Monitor"
+        "command": "claudeMonitor.refresh",
+        "title": "Claude Monitor: Refresh Now",
+        "category": "Claude Monitor"
       }
     ],
     "configuration": {
-      "title": "Claude Code Monitor",
+      "title": "Claude Monitor",
       "properties": {
-        "claudeCodeMonitor.projectsDir": {
+        "claudeMonitor.projectsDir": {
           "type": "string",
           "default": "",
           "markdownDescription": "Override the Claude Code projects directory (defaults to `~/.claude/projects`). Leave empty to use the default."
         },
-        "claudeCodeMonitor.contextLimit": {
+        "claudeMonitor.contextLimit": {
           "type": "number",
           "default": 200000,
           "markdownDescription": "Model context window size in tokens, used to compute the context-usage percentage."
         },
-        "claudeCodeMonitor.refreshIntervalMs": {
+        "claudeMonitor.refreshIntervalMs": {
           "type": "number",
           "default": 1000,
           "minimum": 250,
           "markdownDescription": "Poll interval (ms) for refreshing status from the transcript."
         },
-        "claudeCodeMonitor.retryThresholdMs": {
+        "claudeMonitor.retryThresholdMs": {
           "type": "number",
           "default": 30000,
           "minimum": 5000,
-          "markdownDescription": "If a request stays in-flight longer than this, it is flagged as possibly retrying / timed out."
+          "markdownDescription": "Legacy threshold (deprecated; retry detection is now log-driven)."
         },
-        "claudeCodeMonitor.statusBarAlignment": {
+        "claudeMonitor.statusBarAlignment": {
           "type": "string",
           "enum": ["left", "right"],
           "default": "right",
           "markdownDescription": "Status bar item alignment."
         },
-        "claudeCodeMonitor.showInStatusBar": {
+        "claudeMonitor.showInStatusBar": {
           "type": "boolean",
           "default": true,
           "markdownDescription": "Show the live status bar item."
         },
-        "claudeCodeMonitor.maxHistoryRequests": {
+        "claudeMonitor.maxHistoryRequests": {
           "type": "number",
           "default": 40,
           "minimum": 5,

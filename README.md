@@ -72,22 +72,22 @@
 
 | 命令 | 说明 |
 | --- | --- |
-| `Claude Code: Show Live Dashboard` | 打开 Webview 面板 |
-| `Claude Code: Select Session to Monitor` | 选择监控的会话 |
-| `Claude Code: Open Transcript File` | 打开会话 JSONL 原始文件 |
-| `Claude Code: Refresh Now` | 强制刷新 |
+| `Claude Monitor: Show Live Dashboard` | 打开 Webview 面板 |
+| `Claude Monitor: Select Session to Monitor` | 选择监控的会话 |
+| `Claude Monitor: Open Transcript File` | 打开会话 JSONL 原始文件 |
+| `Claude Monitor: Refresh Now` | 强制刷新 |
 
 ## 🔧 配置项
 
 | 配置键 | 默认值 | 说明 |
 | --- | --- | --- |
-| `claudeCodeMonitor.projectsDir` | `""` (自动检测) | 覆盖 Claude Code projects 目录 |
-| `claudeCodeMonitor.contextLimit` | `200000` | 上下文窗口大小（用于计算百分比） |
-| `claudeCodeMonitor.refreshIntervalMs` | `1000` | 轮询间隔（毫秒） |
-| `claudeCodeMonitor.retryThresholdMs` | `30000` | 旧版阈值（已弃用，重试检测现由日志驱动） |
-| `claudeCodeMonitor.statusBarAlignment` | `"right"` | 状态栏对齐：`left` 或 `right` |
-| `claudeCodeMonitor.showInStatusBar` | `true` | 是否显示状态栏 |
-| `claudeCodeMonitor.maxHistoryRequests` | `40` | Dashboard 保留的最近请求数 |
+| `claudeMonitor.projectsDir` | `""` (自动检测) | 覆盖 Claude Code projects 目录 |
+| `claudeMonitor.contextLimit` | `200000` | 上下文窗口大小（用于计算百分比） |
+| `claudeMonitor.refreshIntervalMs` | `1000` | 轮询间隔（毫秒） |
+| `claudeMonitor.retryThresholdMs` | `30000` | 旧版阈值（已弃用，重试检测现由日志驱动） |
+| `claudeMonitor.statusBarAlignment` | `"right"` | 状态栏对齐：`left` 或 `right` |
+| `claudeMonitor.showInStatusBar` | `true` | 是否显示状态栏 |
+| `claudeMonitor.maxHistoryRequests` | `40` | Dashboard 保留的最近请求数 |
 
 ## 🔨 从源码构建
 
