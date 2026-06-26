@@ -1,7 +1,7 @@
 {
   "name": "claude-code-monitor",
   "displayName": "Claude Code Monitor",
-  "description": "Live status bar + dashboard for Claude Code: model, context size, request time, output rate, and retry/in-flight state, refreshed in real time from the Claude Code transcript.",
+  "description": "🇨🇳 Claude Code 实时状态栏监控 | 🇬🇧 Real-time status bar monitor for Claude Code — model, context, rate, TTFT, retry detection, multi-session",
   "version": "0.1.0",
   "publisher": "xuehun2",
   "license": "MIT",
