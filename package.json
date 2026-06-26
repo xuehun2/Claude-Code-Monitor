@@ -1,0 +1,100 @@
+{
+  "name": "claude-code-monitor",
+  "displayName": "Claude Code Monitor",
+  "description": "Live status bar + dashboard for Claude Code: model, context size, request time, output rate, and retry/in-flight state, refreshed in real time from the Claude Code transcript.",
+  "version": "0.1.0",
+  "publisher": "xuehun2",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/xuehun2/Claude-Code-Monitor.git"
+  },
+  "keywords": ["claude", "claude-code", "monitor", "status-bar", "ai"],
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": ["Other", "Visualization"],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "claudeCodeMonitor.showDashboard",
+        "title": "Claude Code: Show Live Dashboard",
+        "category": "Claude Code Monitor"
+      },
+      {
+        "command": "claudeCodeMonitor.selectSession",
+        "title": "Claude Code: Select Session to Monitor",
+        "category": "Claude Code Monitor"
+      },
+      {
+        "command": "claudeCodeMonitor.openTranscript",
+        "title": "Claude Code: Open Transcript File",
+        "category": "Claude Code Monitor"
+      },
+      {
+        "command": "claudeCodeMonitor.refresh",
+        "title": "Claude Code: Refresh Now",
+        "category": "Claude Code Monitor"
+      }
+    ],
+    "configuration": {
+      "title": "Claude Code Monitor",
+      "properties": {
+        "claudeCodeMonitor.projectsDir": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Override the Claude Code projects directory (defaults to `~/.claude/projects`). Leave empty to use the default."
+        },
+        "claudeCodeMonitor.contextLimit": {
+          "type": "number",
+          "default": 200000,
+          "markdownDescription": "Model context window size in tokens, used to compute the context-usage percentage."
+        },
+        "claudeCodeMonitor.refreshIntervalMs": {
+          "type": "number",
+          "default": 1000,
+          "minimum": 250,
+          "markdownDescription": "Poll interval (ms) for refreshing status from the transcript."
+        },
+        "claudeCodeMonitor.retryThresholdMs": {
+          "type": "number",
+          "default": 30000,
+          "minimum": 5000,
+          "markdownDescription": "If a request stays in-flight longer than this, it is flagged as possibly retrying / timed out."
+        },
+        "claudeCodeMonitor.statusBarAlignment": {
+          "type": "string",
+          "enum": ["left", "right"],
+          "default": "right",
+          "markdownDescription": "Status bar item alignment."
+        },
+        "claudeCodeMonitor.showInStatusBar": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Show the live status bar item."
+        },
+        "claudeCodeMonitor.maxHistoryRequests": {
+          "type": "number",
+          "default": 40,
+          "minimum": 5,
+          "markdownDescription": "How many recent requests to keep for the dashboard sparkline / history table."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "echo skip"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.80.0",
+    "typescript": "^5.4.0"
+  }
+}
