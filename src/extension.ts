@@ -16,18 +16,42 @@ import {
   fileMtimeMs,
   listActiveSessions,
   findTranscriptForSession,
+  collectAllRequests,
   type SessionInfo,
   type ActiveSession,
 } from "./transcript";
-import { LogTailer, defaultCodeLogsDir, type PerSessionLogState } from "./logtail";
+import { LogTailer, defaultCodeLogsDir, collectTtftRecords, type PerSessionLogState } from "./logtail";
 import { Dashboard } from "./dashboard";
 
 let service: MonitorService | undefined;
+
+export interface StatsResult {
+  points: { ts: number; value: number }[];
+  summary: { count: number; avg: number; min: number; max: number; total: number };
+  unit: string;
+  metric: string;
+  model: string;
+  time: string;
+}
 
 export function activate(context: vscode.ExtensionContext): void {
   const dashboard = new Dashboard(context.extensionUri);
   service = new MonitorService(dashboard);
   context.subscriptions.push(service);
+
+  // Webview → extension: statistics requests.
+  dashboard.onMessage = (raw) => {
+    if (!service) {
+      return;
+    }
+    const msg = raw as { type?: string; model?: string; time?: string; metric?: string };
+    if (msg?.type === "getModels") {
+      dashboard.sendModels(service.getModels());
+    } else if (msg?.type === "requestStats") {
+      const data = service.computeStats(msg.model ?? "all", msg.time ?? "all", msg.metric ?? "rate");
+      dashboard.sendStats(data);
+    }
+  };
 
   context.subscriptions.push(
     vscode.commands.registerCommand("claudeMonitor.showDashboard", () => {
@@ -176,6 +200,92 @@ class MonitorService implements vscode.Disposable {
       v.cachedMtime = undefined;
     }
     this.tick();
+  }
+
+  /** Distinct model names seen across all transcripts (for the filter dropdown). */
+  getModels(): string[] {
+    const set = new Set<string>();
+    for (const r of collectAllRequests(this.projectsDir, 0, 5000)) {
+      if (r.model) {
+        set.add(r.model);
+      }
+    }
+    return [...set].sort();
+  }
+
+  /**
+   * Compute a chartable dataset for the statistics view.
+   *   model: "all" | model name
+   *   time: "today" | "week" | "month" | "all"
+   *   metric: "ttft" | "input" | "output" | "rate" | "duration"
+   */
+  computeStats(
+    model: string,
+    time: string,
+    metric: string
+  ): StatsResult {
+    const now = Date.now();
+    const day = 86_400_000;
+    const sinceMs =
+      time === "today" ? now - day
+      : time === "week" ? now - 7 * day
+      : time === "month" ? now - 30 * day
+      : 0;
+
+    const reqs = collectAllRequests(this.projectsDir, sinceMs, 5000);
+    const logPath = this.logTailer.getSummary().logPath;
+    const ttfts = logPath ? collectTtftRecords(logPath, sinceMs) : [];
+
+    const wantModel = model !== "all";
+    let unit = "";
+    let points: { ts: number; value: number }[] = [];
+
+    if (metric === "ttft") {
+      unit = "ms";
+      points = ttfts
+        .filter((t) => !wantModel || t.model === model)
+        .map((t) => ({ ts: t.ts, value: t.ttftMs }));
+    } else {
+      const rs = reqs.filter((r) => !wantModel || r.model === model);
+      if (metric === "input") {
+        unit = "tok";
+        points = rs.map((r) => ({ ts: r.ts, value: r.inputTokens + r.cacheReadTokens }));
+      } else if (metric === "output") {
+        unit = "tok";
+        points = rs.map((r) => ({ ts: r.ts, value: r.outputTokens }));
+      } else if (metric === "duration") {
+        unit = "ms";
+        points = rs.map((r) => ({ ts: r.ts, value: r.durationMs }));
+      } else {
+        // rate (default)
+        unit = "t/s";
+        points = rs.map((r) => ({ ts: r.ts, value: r.outputRate }));
+      }
+    }
+
+    points.sort((a, b) => a.ts - b.ts);
+    const totalCount = points.length;
+    const vals = points.map((p) => p.value);
+    const summary = {
+      count: totalCount,
+      avg: vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : 0,
+      min: vals.length ? Math.min(...vals) : 0,
+      max: vals.length ? Math.max(...vals) : 0,
+      total: vals.reduce((a, b) => a + b, 0),
+    };
+
+    // Sample for display if too many points.
+    const MAX = 120;
+    let display = points;
+    if (points.length > MAX) {
+      const step = points.length / MAX;
+      display = [];
+      for (let i = 0; i < MAX; i++) {
+        display.push(points[Math.floor(i * step)]);
+      }
+    }
+
+    return { points: display, summary, unit, metric, model, time };
   }
 
   private tick(): void {

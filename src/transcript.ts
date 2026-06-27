@@ -159,6 +159,137 @@ export function fileMtimeMs(p: string): number | undefined {
   }
 }
 
+/** Read the ENTIRE transcript file (no tail cap). Used for historical stats. */
+export function readAllEntries(p: string): TranscriptEntry[] {
+  let text: string;
+  try {
+    text = fs.readFileSync(p, "utf8");
+  } catch {
+    return [];
+  }
+  const out: TranscriptEntry[] = [];
+  for (const line of text.split("\n")) {
+    if (!line) {
+      continue;
+    }
+    const o = safeParse(line);
+    if (o) {
+      out.push(o);
+    }
+  }
+  return out;
+}
+
+export interface StatRequest {
+  ts: number; // request end (assistant) timestamp
+  model: string;
+  inputTokens: number; // input_tokens
+  outputTokens: number; // output_tokens
+  cacheReadTokens: number; // cache_read_input_tokens
+  durationMs: number; // request duration
+  outputRate: number; // tokens / second
+}
+
+function tsToMs2(s: string | undefined): number | undefined {
+  if (!s) {
+    return undefined;
+  }
+  const t = Date.parse(s);
+  return Number.isNaN(t) ? undefined : t;
+}
+function num2(n: unknown): number {
+  return typeof n === "number" && Number.isFinite(n) ? n : 0;
+}
+
+/**
+ * Scan all transcript files under projectsDir and collect every model request
+ * record (with full timestamp), filtered to those ending at/after sinceMs.
+ * Files are read most-recent-first and collection stops once `cap` is reached.
+ */
+export function collectAllRequests(
+  projectsDir: string,
+  sinceMs = 0,
+  cap = 5000
+): StatRequest[] {
+  const files: { path: string; mtime: number }[] = [];
+  let subs: string[];
+  try {
+    subs = fs
+      .readdirSync(projectsDir, { withFileTypes: true })
+      .filter((d) => d.isDirectory())
+      .map((d) => d.name);
+  } catch {
+    return [];
+  }
+  for (const sub of subs) {
+    const subDir = path.join(projectsDir, sub);
+    let names: string[];
+    try {
+      names = fs.readdirSync(subDir).filter((f) => f.endsWith(".jsonl"));
+    } catch {
+      continue;
+    }
+    for (const f of names) {
+      const p = path.join(subDir, f);
+      try {
+        files.push({ path: p, mtime: fs.statSync(p).mtimeMs });
+      } catch {
+        // ignore
+      }
+    }
+  }
+  files.sort((a, b) => b.mtime - a.mtime);
+
+  const out: StatRequest[] = [];
+  for (const file of files) {
+    if (out.length >= cap) {
+      break;
+    }
+    // Skip files not modified anywhere near the time window.
+    if (sinceMs > 0 && file.mtime < sinceMs - 86_400_000) {
+      continue;
+    }
+    const entries = readAllEntries(file.path);
+    let pendingStart: number | undefined;
+    for (const e of entries) {
+      if (e.type === "user") {
+        if (e.isApiErrorMessage) {
+          continue;
+        }
+        const ms = tsToMs2(e.timestamp);
+        if (ms !== undefined) {
+          pendingStart = ms;
+        }
+        continue;
+      }
+      if (e.type === "assistant" && e.message && e.message.usage) {
+        const endMs = tsToMs2(e.timestamp);
+        if (pendingStart !== undefined && endMs !== undefined) {
+          const u = e.message.usage;
+          const o = num2(u.output_tokens);
+          const i = num2(u.input_tokens);
+          const cr = num2(u.cache_read_input_tokens);
+          const dur = endMs >= pendingStart ? endMs - pendingStart : 0;
+          if (endMs >= sinceMs) {
+            out.push({
+              ts: endMs,
+              model: e.message.model ?? "unknown",
+              inputTokens: i,
+              outputTokens: o,
+              cacheReadTokens: cr,
+              durationMs: dur,
+              outputRate: dur > 0 ? (o / dur) * 1000 : 0,
+            });
+          }
+          pendingStart = undefined;
+        }
+      }
+    }
+  }
+  out.sort((a, b) => a.ts - b.ts);
+  return out;
+}
+
 /**
  * Pick the best session to monitor. Prefers the most recently modified session
  * whose cwd matches the given workspace folder; falls back to the global

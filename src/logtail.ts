@@ -382,6 +382,45 @@ function extractTime(line: string, fallback: number): number {
   return fallback;
 }
 
+export interface TtftRecord {
+  ts: number;
+  model: string;
+  ttftMs: number;
+}
+
+/**
+ * Scan the ENTIRE log file for historical TTFT (time-to-first-token) entries.
+ * Each "first byte after Xms" line is timestamped; the model is taken from the
+ * most recent "[API:timing] dispatching to firstParty model=..." line. Returns
+ * records at/after sinceMs, sorted ascending.
+ */
+export function collectTtftRecords(logPath: string, sinceMs = 0): TtftRecord[] {
+  let text: string;
+  try {
+    text = fs.readFileSync(logPath, "utf8");
+  } catch {
+    return [];
+  }
+  const out: TtftRecord[] = [];
+  let currentModel = "unknown";
+  for (const line of text.split("\n")) {
+    const m = /\[API:timing\] dispatching to firstParty model=(\S+)/.exec(line);
+    if (m) {
+      currentModel = m[1];
+      continue;
+    }
+    const fb = /first byte after (\d+)ms/.exec(line);
+    if (fb) {
+      const ts = extractTime(line, Date.now());
+      if (ts >= sinceMs) {
+        out.push({ ts, model: currentModel, ttftMs: parseInt(fb[1], 10) });
+      }
+    }
+  }
+  out.sort((a, b) => a.ts - b.ts);
+  return out;
+}
+
 export function findLatestLog(codeLogsDir: string): string | undefined {
   let sessions: string[];
   try {
