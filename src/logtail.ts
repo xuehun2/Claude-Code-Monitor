@@ -79,6 +79,11 @@ export class LogTailer implements vscode.Disposable {
     this.listeners.push(fn);
   }
 
+  /** The VS Code logs directory this tailer was configured with. */
+  get logsDir(): string {
+    return this.codeLogsDir;
+  }
+
   getSummary(): LogSummary {
     return {
       available: !!this.logPath && this.fd !== undefined,
@@ -389,35 +394,88 @@ export interface TtftRecord {
 }
 
 /**
- * Scan the ENTIRE log file for historical TTFT (time-to-first-token) entries.
- * Each "first byte after Xms" line is timestamped; the model is taken from the
- * most recent "[API:timing] dispatching to firstParty model=..." line. Returns
- * records at/after sinceMs, sorted ascending.
+ * Scan ALL VS Code log files for historical TTFT entries within the given time
+ * window. Each "first byte after Xms" line is timestamped; the model is taken
+ * from the most recent "[API:timing] dispatching to firstParty model=..." line.
+ * Returns records at/after sinceMs, sorted ascending.
+ *
+ * Unlike the old version which only scanned a single logPath, this walks every
+ * log file under codeLogsDir whose mtime falls within range.
  */
-export function collectTtftRecords(logPath: string, sinceMs = 0): TtftRecord[] {
-  let text: string;
-  try {
-    text = fs.readFileSync(logPath, "utf8");
-  } catch {
-    return [];
-  }
+export function collectTtftRecords(codeLogsDir: string, sinceMs = 0): TtftRecord[] {
+  const logFiles = findAllLogFiles(codeLogsDir);
   const out: TtftRecord[] = [];
-  let currentModel = "unknown";
-  for (const line of text.split("\n")) {
-    const m = /\[API:timing\] dispatching to firstParty model=(\S+)/.exec(line);
-    if (m) {
-      currentModel = m[1];
+
+  for (const logPath of logFiles) {
+    // Quick check: if the file wasn't modified anywhere near the time window,
+    // skip it entirely. We use mtime as an upper bound — a file last modified
+    // before sinceMs cannot contain records after sinceMs.
+    try {
+      const stat = fs.statSync(logPath);
+      if (sinceMs > 0 && stat.mtimeMs < sinceMs - 86_400_000) {
+        continue;
+      }
+    } catch {
       continue;
     }
-    const fb = /first byte after (\d+)ms/.exec(line);
-    if (fb) {
-      const ts = extractTime(line, Date.now());
-      if (ts >= sinceMs) {
-        out.push({ ts, model: currentModel, ttftMs: parseInt(fb[1], 10) });
+
+    let text: string;
+    try {
+      text = fs.readFileSync(logPath, "utf8");
+    } catch {
+      continue;
+    }
+    let currentModel = "unknown";
+    for (const line of text.split("\n")) {
+      const m = /\[API:timing\] dispatching to firstParty model=(\S+)/.exec(line);
+      if (m) {
+        currentModel = m[1];
+        continue;
+      }
+      const fb = /first byte after (\d+)ms/.exec(line);
+      if (fb) {
+        const ts = extractTime(line, Date.now());
+        if (ts >= sinceMs) {
+          out.push({ ts, model: currentModel, ttftMs: parseInt(fb[1], 10) });
+        }
       }
     }
   }
   out.sort((a, b) => a.ts - b.ts);
+  return out;
+}
+
+export function findAllLogFiles(codeLogsDir: string): string[] {
+  let sessions: string[];
+  try {
+    sessions = fs
+      .readdirSync(codeLogsDir, { withFileTypes: true })
+      .filter((d) => d.isDirectory())
+      .map((d) => d.name);
+  } catch {
+    return [];
+  }
+  const out: string[] = [];
+  for (const s of sessions) {
+    let windows: string[];
+    try {
+      windows = fs
+        .readdirSync(path.join(codeLogsDir, s), { withFileTypes: true })
+        .filter((d) => d.isDirectory() && d.name.startsWith("window"))
+        .map((d) => path.join(codeLogsDir, s, d.name));
+    } catch {
+      windows = [];
+    }
+    for (const w of windows) {
+      const candidate = path.join(w, "exthost", "Anthropic.claude-code", "Claude VScode.log");
+      try {
+        fs.statSync(candidate);
+        out.push(candidate);
+      } catch {
+        // not present in this window
+      }
+    }
+  }
   return out;
 }
 

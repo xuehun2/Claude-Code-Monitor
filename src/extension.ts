@@ -17,21 +17,22 @@ import {
   listActiveSessions,
   findTranscriptForSession,
   collectAllRequests,
+  collectRequestsFromFile,
   type SessionInfo,
   type ActiveSession,
+  type StatRequest,
 } from "./transcript";
-import { LogTailer, defaultCodeLogsDir, collectTtftRecords, type PerSessionLogState } from "./logtail";
+import { LogTailer, defaultCodeLogsDir, type PerSessionLogState } from "./logtail";
 import { Dashboard } from "./dashboard";
 
 let service: MonitorService | undefined;
 
 export interface StatsResult {
-  points: { ts: number; value: number }[];
+  points: { ts: number; value: number; req: StatRequest }[];
   summary: { count: number; avg: number; min: number; max: number; total: number };
   unit: string;
   metric: string;
   model: string;
-  time: string;
 }
 
 export function activate(context: vscode.ExtensionContext): void {
@@ -44,18 +45,27 @@ export function activate(context: vscode.ExtensionContext): void {
     if (!service) {
       return;
     }
-    const msg = raw as { type?: string; model?: string; time?: string; metric?: string };
+    const msg = raw as { type?: string; model?: string; metric?: string };
     if (msg?.type === "getModels") {
       dashboard.sendModels(service.getModels());
     } else if (msg?.type === "requestStats") {
-      const data = service.computeStats(msg.model ?? "all", msg.time ?? "all", msg.metric ?? "rate");
+      const data = service.computeStats(msg.model ?? "all", msg.metric ?? "rate");
       dashboard.sendStats(data);
     }
   };
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("claudeMonitor.showDashboard", () => {
-      dashboard.show(service?.state);
+    vscode.commands.registerCommand("claudeMonitor.showDashboard", (sessionId?: string) => {
+      if (sessionId) {
+        // Pin dashboard to a specific session (clicked from a status bar).
+        dashboard.currentSessionId = sessionId;
+      }
+      const v = sessionId ? service?.views.get(sessionId) : service?.mostRecentView();
+      dashboard.show(v?.state ?? service?.state);
+      // If switching sessions, tell the dashboard to re-fetch stats.
+      if (sessionId && dashboard.visible) {
+        dashboard.refreshStats();
+      }
     }),
     vscode.commands.registerCommand("claudeMonitor.selectSession", async () => {
       await service?.pickSession();
@@ -95,7 +105,7 @@ class MonitorService implements vscode.Disposable {
   private claudeDir: string;
   private projectsDir: string;
   private sessions: SessionInfo[] = [];
-  private views = new Map<string, SessionView>();
+  views = new Map<string, SessionView>();
 
   private timer: NodeJS.Timeout | undefined;
   private readonly disposables: vscode.Disposable[] = [];
@@ -202,10 +212,14 @@ class MonitorService implements vscode.Disposable {
     this.tick();
   }
 
-  /** Distinct model names seen across all transcripts (for the filter dropdown). */
+  /** Distinct model names seen in the current session's transcript. */
   getModels(): string[] {
     const set = new Set<string>();
-    for (const r of collectAllRequests(this.projectsDir, 0, 5000)) {
+    // Only collect models from the current (dashboard) session
+    const sid = this.dashboard.currentSessionId;
+    const v = sid ? this.views.get(sid) : this.mostRecentView();
+    const tp = v?.active.transcriptPath;
+    for (const r of collectRequestsFromFile(tp, 0)) {
       if (r.model) {
         set.add(r.model);
       }
@@ -215,52 +229,38 @@ class MonitorService implements vscode.Disposable {
 
   /**
    * Compute a chartable dataset for the statistics view.
+   * Scoped to the current session only.
    *   model: "all" | model name
-   *   time: "today" | "week" | "month" | "all"
-   *   metric: "ttft" | "input" | "output" | "rate" | "duration"
+   *   metric: "input" | "output" | "rate" | "duration"
    */
   computeStats(
     model: string,
-    time: string,
     metric: string
   ): StatsResult {
-    const now = Date.now();
-    const day = 86_400_000;
-    const sinceMs =
-      time === "today" ? now - day
-      : time === "week" ? now - 7 * day
-      : time === "month" ? now - 30 * day
-      : 0;
-
-    const reqs = collectAllRequests(this.projectsDir, sinceMs, 5000);
-    const logPath = this.logTailer.getSummary().logPath;
-    const ttfts = logPath ? collectTtftRecords(logPath, sinceMs) : [];
+    // Only collect requests from the current session's transcript.
+    const sid = this.dashboard.currentSessionId;
+    const v = sid ? this.views.get(sid) : this.mostRecentView();
+    const tp = v?.active.transcriptPath;
+    const reqs = collectRequestsFromFile(tp, 0);
 
     const wantModel = model !== "all";
+    const rs = reqs.filter((r) => !wantModel || r.model === model);
     let unit = "";
-    let points: { ts: number; value: number }[] = [];
+    let points: { ts: number; value: number; req: StatRequest }[] = [];
 
-    if (metric === "ttft") {
+    if (metric === "input") {
+      unit = "tok";
+      points = rs.map((r) => ({ ts: r.ts, value: r.inputTokens + r.cacheReadTokens, req: r }));
+    } else if (metric === "output") {
+      unit = "tok";
+      points = rs.map((r) => ({ ts: r.ts, value: r.outputTokens, req: r }));
+    } else if (metric === "duration") {
       unit = "ms";
-      points = ttfts
-        .filter((t) => !wantModel || t.model === model)
-        .map((t) => ({ ts: t.ts, value: t.ttftMs }));
+      points = rs.map((r) => ({ ts: r.ts, value: r.durationMs, req: r }));
     } else {
-      const rs = reqs.filter((r) => !wantModel || r.model === model);
-      if (metric === "input") {
-        unit = "tok";
-        points = rs.map((r) => ({ ts: r.ts, value: r.inputTokens + r.cacheReadTokens }));
-      } else if (metric === "output") {
-        unit = "tok";
-        points = rs.map((r) => ({ ts: r.ts, value: r.outputTokens }));
-      } else if (metric === "duration") {
-        unit = "ms";
-        points = rs.map((r) => ({ ts: r.ts, value: r.durationMs }));
-      } else {
-        // rate (default)
-        unit = "t/s";
-        points = rs.map((r) => ({ ts: r.ts, value: r.outputRate }));
-      }
+      // rate (default)
+      unit = "t/s";
+      points = rs.map((r) => ({ ts: r.ts, value: r.outputRate, req: r }));
     }
 
     points.sort((a, b) => a.ts - b.ts);
@@ -274,18 +274,7 @@ class MonitorService implements vscode.Disposable {
       total: vals.reduce((a, b) => a + b, 0),
     };
 
-    // Sample for display if too many points.
-    const MAX = 120;
-    let display = points;
-    if (points.length > MAX) {
-      const step = points.length / MAX;
-      display = [];
-      for (let i = 0; i < MAX; i++) {
-        display.push(points[Math.floor(i * step)]);
-      }
-    }
-
-    return { points: display, summary, unit, metric, model, time };
+    return { points, summary, unit, metric, model };
   }
 
   private tick(): void {
@@ -416,7 +405,7 @@ class MonitorService implements vscode.Disposable {
     }
   }
 
-  private mostRecentView(): SessionView | undefined {
+  mostRecentView(): SessionView | undefined {
     let best: SessionView | undefined;
     for (const v of this.views.values()) {
       const t = v.state?.updatedAtMs ?? 0;
@@ -496,6 +485,9 @@ function statusText(s: MonitorState): string {
   } else if (s.phase === "interrupted") {
     slot = ` ⏹interrupted`;
   }
+  if (s.contextPct > 0.95) {
+    slot += ` ⚠compact!`;
+  }
 
   return `${icon} ${title} · ${model} · ${ctx} (${pct}) · [${rateSlot}]${slot}`;
 }
@@ -505,6 +497,9 @@ function statusBgKey(s: MonitorState): "warning" | "error" | "none" {
     return "warning";
   }
   if (s.phase === "interrupted") {
+    return "error";
+  }
+  if (s.contextPct > 0.95) {
     return "error";
   }
   return "none";
@@ -549,6 +544,9 @@ function statusTooltip(s: MonitorState): string {
   }
   lines.push(`- **Model:** ${s.model ?? "—"}${s.serviceTier ? ` (${s.serviceTier}` : ""}${s.speed ? `, ${s.speed}` : ""}${s.serviceTier ? ")" : ""}`);
   lines.push(`- **Context:** ${fmtTokens(s.contextTokens)} / ${fmtTokens(s.contextLimit)} (${(s.contextPct * 100).toFixed(1)}%)`);
+  if (s.contextPct > 0.95) {
+    lines.push(`  - ⚠ **Context critically high!** Run \`/compact\` to free space.`);
+  }
   if (s.lastRequest) {
     lines.push(`- **Last request:** ${fmtMs(s.lastRequest.durationMs)} · ${fmtRate(s.lastRequest.outputRate)} · ${fmtTokens(s.lastRequest.outputTokens)} out · stop=${s.lastRequest.stopReason ?? "—"}`);
   }

@@ -71,6 +71,11 @@ export class Dashboard {
     this.panel?.webview.postMessage({ type: "stats", data });
   }
 
+  /** Ask the webview to re-request stats (e.g. after switching sessions). */
+  refreshStats(): void {
+    this.panel?.webview.postMessage({ type: "refreshStats" });
+  }
+
   private getHtml(): string {
     const nonce = getNonce();
     const csp = [
@@ -107,9 +112,9 @@ export class Dashboard {
   .status.idle { background: rgba(120,120,120,.25); }
   .status.running { background: rgba(60,170,80,.25); color: #5fcf80; }
   .status.retrying { background: rgba(220,160,40,.25); color: #e0a93b; }
-  .bar { height: 8px; background: rgba(125,125,125,.25); border-radius: 4px; overflow:hidden; margin-top:6px; }
-  .bar > div { height:100%; background: var(--vscode-charts-blue, #3794ff); transition: width .3s; }
-  .bar.high > div { background: var(--vscode-charts-red, #f14c4c); }
+  .ctxbar { height: 8px; background: rgba(125,125,125,.25); border-radius: 4px; overflow:hidden; margin-top:6px; }
+  .ctxbar > div { height:100%; background: var(--vscode-charts-blue, #3794ff); transition: width .3s; }
+  .ctxbar.high > div { background: var(--vscode-charts-red, #f14c4c); }
   table { width:100%; border-collapse: collapse; font-size: 12px; margin-top: 6px; font-variant-numeric: tabular-nums; }
   th, td { text-align:left; padding: 4px 6px; border-bottom: 1px solid var(--vscode-editorWidget-border, rgba(125,125,125,.15)); }
   th { opacity:.6; font-weight:600; }
@@ -132,17 +137,26 @@ export class Dashboard {
   .sumgrid .s { background: var(--vscode-editor-inactive-selection-background); border-radius:6px; padding:8px 10px; }
   .sumgrid .s .l { font-size:10px; opacity:.6; text-transform:uppercase; letter-spacing:.04em; }
   .sumgrid .s .v { font-size:15px; font-weight:600; font-variant-numeric: tabular-nums; }
-  .chartwrap { display:flex; gap:8px; height:220px; background: var(--vscode-editor-inactive-selection-background); border-radius:6px; padding:10px; box-sizing:border-box; }
-  .yaxis { display:flex; flex-direction:column; justify-content:space-between; width:54px; font-size:10px; opacity:.55; text-align:right; font-variant-numeric: tabular-nums; padding-bottom:18px; }
-  .plot { flex:1; display:flex; flex-direction:column; }
-  .plotgrid { position:relative; flex:1; }
+
+  /* Scrollable chart with fixed Y-axis */
+  .chartouter { position:relative; display:flex; background: var(--vscode-editor-inactive-selection-background); border-radius:6px; padding:10px 10px 0 10px; box-sizing:border-box; }
+  .yaxis { flex-shrink:0; display:flex; flex-direction:column; justify-content:space-between; width:58px; font-size:10px; opacity:.55; text-align:right; font-variant-numeric: tabular-nums; padding-right:6px; }
+  .chartscroll { flex:1; overflow-x:auto; overflow-y:visible; position:relative; min-width:0; padding-bottom:8px; }
+  .chartscroll::-webkit-scrollbar { height:6px; }
+  .chartscroll::-webkit-scrollbar-thumb { background:var(--vscode-scrollbarSlider-background, rgba(121,121,121,.4)); border-radius:3px; }
+  .plot { min-width:100%; display:flex; flex-direction:column; position:relative; }
+  .plotgrid { position:relative; height:190px; }
   .gridline { position:absolute; left:0; right:0; border-top:1px dashed rgba(125,125,125,.18); }
-  .bars { display:flex; align-items:flex-end; gap:1px; height:100%; }
-  .bars .bar { flex:1; min-width:2px; background: var(--vscode-charts-blue, #3794ff); opacity:.85; border-radius:2px 2px 0 0; cursor:pointer; position:relative; }
+  /* X-axis time tick marks */
+  .xtick { position:absolute; bottom:0; width:1px; height:6px; background:rgba(125,125,125,.35); }
+  .xlabel { position:absolute; top:2px; transform:translateX(-50%); font-size:9px; opacity:.5; white-space:nowrap; font-variant-numeric:tabular-nums; }
+  .bars { display:flex; align-items:flex-end; gap:2px; height:100%; flex-wrap:nowrap; }
+  .bars .bar { flex:none; width:27px; min-width:27px; background: var(--vscode-charts-blue, #3794ff); opacity:.85; border-radius:2px 2px 0 0; cursor:pointer; position:relative; }
   .bars .bar:hover { opacity:1; background: var(--vscode-charts-green, #89d185); }
-  .bars .bar .tip { display:none; position:absolute; bottom:100%; left:50%; transform:translateX(-50%); background:var(--vscode-editorHoverWidget-background, #000); color:var(--vscode-editorHoverWidget-foreground, #fff); border:1px solid var(--vscode-editorWidget-border,#555); border-radius:4px; padding:3px 6px; font-size:10px; white-space:nowrap; z-index:5; }
-  .bars .bar:hover .tip { display:block; }
-  .xaxis { height:16px; display:flex; justify-content:space-between; font-size:10px; opacity:.5; margin-top:2px; }
+  .bars .bar.capped { background: var(--vscode-charts-orange, #cca700); }
+  /* Rich tooltip — fixed position, positioned by JS */
+  .tooltip { display:none; position:fixed; background:var(--vscode-editorHoverWidget-background, #000); color:var(--vscode-editorHoverWidget-foreground, #fff); border:1px solid var(--vscode-editorWidget-border,#555); border-radius:6px; padding:6px 10px; font-size:11px; white-space:nowrap; z-index:9999; line-height:1.6; pointer-events:none; max-height:220px; overflow:hidden; }
+  .xaxis { height:20px; position:relative; margin-top:2px; }
   .empty { margin: auto; opacity:.5; font-size:12px; }
 </style>
 </head>
@@ -160,7 +174,7 @@ export class Dashboard {
   <div class="grid">
     <div class="card"><div class="label">Model</div><div class="value" id="model">—</div><div class="sub" id="tier"></div></div>
     <div class="card"><div class="label">Context</div><div class="value" id="ctx">—</div>
-      <div class="bar" id="ctxbar"><div style="width:0%"></div></div>
+      <div class="ctxbar" id="ctxbar"><div style="width:0%"></div></div>
       <div class="sub" id="ctxsub"></div></div>
     <div class="card"><div class="label">Last request</div><div class="value" id="dur">—</div><div class="sub" id="durSub"></div></div>
     <div class="card"><div class="label">Output rate</div><div class="value" id="rate">—</div><div class="sub" id="rateSub"></div></div>
@@ -171,14 +185,7 @@ export class Dashboard {
   <h1 style="margin-top:18px">统计 · Statistics</h1>
   <div class="filters">
     <label>模型 Model <select id="f-model"><option value="all">全部 All</option></select></label>
-    <label>时间 Time <select id="f-time">
-      <option value="today">本日 Today</option>
-      <option value="week">本周 Week</option>
-      <option value="month">本月 Month</option>
-      <option value="all" selected>全部 All</option>
-    </select></label>
     <label>类型 Metric <select id="f-metric">
-      <option value="ttft">初次返回时间 TTFT</option>
       <option value="input">输入token Input</option>
       <option value="output">输出token Output</option>
       <option value="rate" selected>速率 Rate</option>
@@ -186,13 +193,16 @@ export class Dashboard {
     </select></label>
   </div>
   <div class="sumgrid" id="sumgrid"></div>
-  <div class="chartwrap">
+  <div class="chartouter">
     <div class="yaxis" id="yaxis"></div>
-    <div class="plot">
-      <div class="plotgrid"><div class="bars" id="bars"></div></div>
-      <div class="xaxis" id="xaxis"></div>
+    <div class="chartscroll" id="chartscroll">
+      <div class="plot" id="plot">
+        <div class="plotgrid" id="plotgrid"><div class="bars" id="bars"></div></div>
+        <div class="xaxis" id="xaxis"></div>
+      </div>
     </div>
   </div>
+  <div class="tooltip" id="tooltip"></div>
 
   <h1 style="margin-top:18px">Recent requests</h1>
   <table>
@@ -205,7 +215,7 @@ export class Dashboard {
   const $ = (id) => document.getElementById(id);
 
   function setBar(barEl, pct) {
-    barEl.className = "bar" + (pct >= 0.8 ? " high" : "");
+    barEl.className = "ctxbar" + (pct >= 0.8 ? " high" : "");
     barEl.firstElementChild.style.width = Math.min(100, Math.round(pct*100)) + "%";
   }
 
@@ -221,12 +231,98 @@ export class Dashboard {
     if(unit==='t/s') return fmtRate(v);
     return String(v);
   }
-  const METRIC_LABEL = { ttft:'初次返回时间', input:'输入token', output:'输出token', rate:'速率', duration:'会话时间' };
 
   function requestStats() {
-    vscode.postMessage({ type:'requestStats', model: $('f-model').value, time: $('f-time').value, metric: $('f-metric').value });
+    vscode.postMessage({ type:'requestStats', model: $('f-model').value, metric: $('f-metric').value });
   }
-  ['f-model','f-time','f-metric'].forEach(id => { $(id).addEventListener('change', requestStats); });
+  ['f-model','f-metric'].forEach(id => { $(id).addEventListener('change', requestStats); });
+  // Hide tooltip when scrolling the chart
+  $('chartscroll').addEventListener('scroll', hideTooltip);
+
+  /**
+   * Compute smart X-axis time tick positions.
+   * Returns an array of { ts, label } where ts is the timestamp and label
+   * is the formatted time string.
+   */
+  function computeXTicks(points) {
+    if (!points.length) return [];
+    const minTs = points[0].ts;
+    const maxTs = points[points.length - 1].ts;
+    const span = maxTs - minTs;
+    if (span <= 0) return [{ ts: minTs, label: fmtTime(minTs) }];
+
+    // Choose interval based on span
+    const intervals = [
+      60_000,       // 1 min
+      5 * 60_000,   // 5 min
+      10 * 60_000,  // 10 min
+      30 * 60_000,  // 30 min
+      3600_000,     // 1 hour
+      3 * 3600_000, // 3 hours
+      6 * 3600_000, // 6 hours
+      12 * 3600_000,// 12 hours
+      86400_000,    // 1 day
+    ];
+    // Aim for ~4-8 ticks
+    let interval = intervals[intervals.length - 1];
+    for (const iv of intervals) {
+      if (span / iv <= 8) { interval = iv; break; }
+    }
+
+    const ticks = [];
+    const start = Math.ceil(minTs / interval) * interval;
+    for (let t = start; t <= maxTs; t += interval) {
+      ticks.push({ ts: t, label: fmtTime(t) });
+    }
+    // Always include first and last if they'd be missed
+    if (ticks.length === 0 || ticks[0].ts - minTs > interval * 0.3) {
+      ticks.unshift({ ts: minTs, label: fmtTime(minTs) });
+    }
+    if (ticks.length === 0 || maxTs - ticks[ticks.length-1].ts > interval * 0.3) {
+      ticks.push({ ts: maxTs, label: fmtTime(maxTs) });
+    }
+    return ticks;
+  }
+
+  function fmtTime(ts) {
+    const d = new Date(ts);
+    const h = String(d.getHours()).padStart(2, '0');
+    const m = String(d.getMinutes()).padStart(2, '0');
+    const s = String(d.getSeconds()).padStart(2, '0');
+    const mo = String(d.getMonth()+1).padStart(2,'0');
+    const day = String(d.getDate()).padStart(2,'0');
+    // Show date if it's not today, or just time
+    const now = new Date();
+    const isToday = d.toDateString() === now.toDateString();
+    return isToday ? h+':'+m+':'+s : mo+'/'+day+' '+h+':'+m;
+  }
+
+  function fmtTimeFull(ts) {
+    return new Date(ts).toLocaleString();
+  }
+
+  // Global tooltip element
+  const tooltip = $('tooltip');
+
+  // Show tooltip near the hovered bar, using fixed positioning to avoid clipping
+  function showTooltip(barEl, html) {
+    tooltip.innerHTML = html;
+    tooltip.style.display = 'block';
+    const rect = barEl.getBoundingClientRect();
+    const tw = tooltip.offsetWidth;
+    const th = tooltip.offsetHeight;
+    let left = rect.left + rect.width / 2 - tw / 2;
+    let top = rect.top - th - 6;
+    // Clamp to viewport
+    if (left < 4) left = 4;
+    if (left + tw > window.innerWidth - 4) left = window.innerWidth - tw - 4;
+    if (top < 4) top = rect.bottom + 6; // flip below if no room above
+    tooltip.style.left = left + 'px';
+    tooltip.style.top = top + 'px';
+  }
+  function hideTooltip() {
+    tooltip.style.display = 'none';
+  }
 
   function renderStats(s) {
     const unit = s.unit;
@@ -240,8 +336,11 @@ export class Dashboard {
       ['平均 Avg', fmtVal(sum.avg ?? 0, unit)],
       ['最小 Min', fmtVal(sum.min ?? 0, unit)],
       ['最大 Max', fmtVal(sum.max ?? 0, unit)],
-      ['合计 Total', fmtVal(sum.total ?? 0, unit)],
     ];
+    // "合计 Total" is meaningless for rate (average of rates ≠ total rate).
+    if (s.metric !== 'rate') {
+      cards.push(['合计 Total', fmtVal(sum.total ?? 0, unit)]);
+    }
     cards.forEach(([l,v]) => {
       const d = document.createElement('div'); d.className='s';
       d.innerHTML = '<div class="l">'+esc(l)+'</div><div class="v">'+esc(v)+'</div>';
@@ -249,38 +348,84 @@ export class Dashboard {
     });
 
     const bars = $('bars'); const yaxis = $('yaxis'); const xaxis = $('xaxis');
+    const plot = $('plot'); const plotgrid = $('plotgrid');
     bars.innerHTML = ''; yaxis.innerHTML = ''; xaxis.innerHTML = '';
+    // Remove old gridlines and ticks
+    [...plotgrid.querySelectorAll('.gridline')].forEach(g=>g.remove());
+    [...xaxis.querySelectorAll('.xtick,.xlabel')].forEach(g=>g.remove());
+
     if (!points.length) {
       bars.innerHTML = '<div class="empty">无数据 No data for this filter</div>';
       return;
     }
-    const max = Math.max(...points.map(p=>p.value), 1);
-    // Y axis: 5 steps (top→bottom)
+
+    // P95 outlier capping: Y-axis max = P95 of values, bars above are capped
+    const allVals = points.map(p => p.value).sort((a, b) => a - b);
+    const p95Idx = Math.min(Math.floor(allVals.length * 0.95), allVals.length - 1);
+    const yMax = Math.max(allVals[p95Idx], 1); // Y-axis ceiling
+    const hasCapped = allVals.some(v => v > yMax);
+
+    // Y axis: STEPS+1 labels from top (yMax) to bottom (0)
     const STEPS = 5;
     for (let i=STEPS; i>=0; i--) {
-      const v = max * i / STEPS;
+      const v = yMax * i / STEPS;
       const d = document.createElement('div'); d.textContent = fmtVal(v, unit);
       yaxis.appendChild(d);
     }
     // gridlines
-    const plot = bars.parentElement;
-    [...plot.querySelectorAll('.gridline')].forEach(g=>g.remove());
     for (let i=1;i<STEPS;i++){
-      const g=document.createElement('div'); g.className='gridline'; g.style.bottom=(i/STEPS*100)+'%'; plot.appendChild(g);
+      const g=document.createElement('div'); g.className='gridline'; g.style.bottom=(i/STEPS*100)+'%'; plotgrid.appendChild(g);
     }
-    // bars
-    points.forEach(p => {
-      const b = document.createElement('div'); b.className='bar';
-      b.style.height = Math.max(1, (p.value/max*100)) + '%';
-      const tip = document.createElement('div'); tip.className='tip';
-      tip.textContent = fmtVal(p.value, unit) + ' · ' + new Date(p.ts).toLocaleString();
-      b.appendChild(tip);
+
+    // Fixed bar width: 27px bar + 2px gap = 29px per bar
+    const barSlot = 29;
+    const neededWidth = points.length * barSlot;
+    const scrollContainer = $('chartscroll');
+    const availableWidth = scrollContainer.clientWidth - 4;
+    const chartWidth = Math.max(neededWidth, availableWidth);
+    plot.style.minWidth = chartWidth + 'px';
+
+    // bars — capped values get a special class and ▲ indicator
+    points.forEach((p, idx) => {
+      const b = document.createElement('div');
+      const capped = p.value > yMax;
+      b.className = 'bar' + (capped ? ' capped' : '');
+      b.style.height = Math.max(1, (Math.min(p.value, yMax) / yMax * 100)) + '%';
+      b.dataset.idx = idx;
+      const r = p.req || {};
+      let lines = [];
+      lines.push('<b>' + esc(fmtVal(p.value, unit)) + (capped ? ' ▲' : '') + '</b>');
+      lines.push('时间: ' + esc(fmtTimeFull(p.ts)));
+      lines.push('模型: ' + esc(r.model || '—'));
+      lines.push('耗时: ' + esc(fmtMs(r.durationMs || 0)));
+      lines.push('输出: ' + esc(fmtTok(r.outputTokens || 0)) + ' @ ' + esc(fmtRate(r.outputRate || 0)));
+      lines.push('输入: ' + esc(fmtTok((r.inputTokens||0) + (r.cacheReadTokens||0))));
+      if (r.cacheReadTokens) lines.push('缓存读: ' + esc(fmtTok(r.cacheReadTokens)));
+      const tipHtml = lines.join('<br>');
+      b.addEventListener('mouseenter', () => showTooltip(b, tipHtml));
+      b.addEventListener('mouseleave', hideTooltip);
       bars.appendChild(b);
     });
-    // X axis range
-    const t0 = new Date(points[0].ts).toLocaleDateString();
-    const t1 = new Date(points[points.length-1].ts).toLocaleDateString();
-    xaxis.innerHTML = '<span>'+esc(t0)+'</span><span>'+esc(t1)+'</span>';
+
+    // X-axis time ticks
+    const ticks = computeXTicks(points);
+    const tsMin = points[0].ts;
+    const tsMax = points[points.length - 1].ts;
+    const tsSpan = tsMax - tsMin || 1;
+    ticks.forEach(t => {
+      const pct = ((t.ts - tsMin) / tsSpan) * 100;
+      // Tick line
+      const tick = document.createElement('div');
+      tick.className = 'xtick';
+      tick.style.left = pct + '%';
+      xaxis.appendChild(tick);
+      // Label
+      const lbl = document.createElement('div');
+      lbl.className = 'xlabel';
+      lbl.style.left = pct + '%';
+      lbl.textContent = t.label;
+      xaxis.appendChild(lbl);
+    });
   }
 
   window.addEventListener('message', e => {
@@ -297,6 +442,7 @@ export class Dashboard {
       return;
     }
     if (msg.type === 'stats') { renderStats(msg.data); return; }
+    if (msg.type === 'refreshStats') { requestStats(); return; }
     if (msg.type === 'live') {
       const s = msg.data;
       if (!s) return;

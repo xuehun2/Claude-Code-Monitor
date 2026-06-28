@@ -229,15 +229,18 @@ export function computeState(
       if (usage?.speed) {
         state.speed = usage.speed;
       }
-      // Always reflect the freshest context size we've seen.
-      state.contextTokens = contextTokens;
+      // Only update context when we have real data (>0). Some assistant
+      // entries (e.g. tool-result responses, sub-agent calls) carry zero
+      // usage — we must not overwrite a valid context reading with 0.
+      if (contextTokens > 0) {
+        state.contextTokens = contextTokens;
+      }
 
       // Only emit a request record when a user/tool-result entry preceded
-      // this one. Claude Code writes the same assistant message multiple
-      // times (streaming snapshots); those re-writes have no new preceding
-      // user entry, so pendingStartMs is undefined and we skip them — this
-      // is what dedups the duplicates naturally.
-      if (pendingStartMs !== undefined) {
+      // this one AND the request has meaningful output (outputTokens > 0 or
+      // a real duration). Entries with zero usage produce meaningless rate
+      // and context readings — skip them.
+      if (pendingStartMs !== undefined && outputTokens > 0) {
         const startMs = pendingStartMs;
         const durationMs = endMs >= startMs ? endMs - startMs : 0;
         const outputRate =

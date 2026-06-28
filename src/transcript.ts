@@ -188,6 +188,7 @@ export interface StatRequest {
   cacheReadTokens: number; // cache_read_input_tokens
   durationMs: number; // request duration
   outputRate: number; // tokens / second
+  startTs: number; // request start (user) timestamp
 }
 
 function tsToMs2(s: string | undefined): number | undefined {
@@ -279,10 +280,64 @@ export function collectAllRequests(
               cacheReadTokens: cr,
               durationMs: dur,
               outputRate: dur > 0 ? (o / dur) * 1000 : 0,
+              startTs: pendingStart,
             });
           }
           pendingStart = undefined;
         }
+      }
+    }
+  }
+  out.sort((a, b) => a.ts - b.ts);
+  return out;
+}
+
+/**
+ * Collect requests from a single transcript file (for the stats panel
+ * scoped to the current session).
+ */
+export function collectRequestsFromFile(
+  transcriptPath: string | undefined,
+  sinceMs = 0
+): StatRequest[] {
+  if (!transcriptPath) {
+    return [];
+  }
+  const entries = readAllEntries(transcriptPath);
+  const out: StatRequest[] = [];
+  let pendingStart: number | undefined;
+  for (const e of entries) {
+    if (e.type === "user") {
+      if (e.isApiErrorMessage) {
+        continue;
+      }
+      const ms = tsToMs2(e.timestamp);
+      if (ms !== undefined) {
+        pendingStart = ms;
+      }
+      continue;
+    }
+    if (e.type === "assistant" && e.message && e.message.usage) {
+      const endMs = tsToMs2(e.timestamp);
+      if (pendingStart !== undefined && endMs !== undefined) {
+        const u = e.message.usage;
+        const o = num2(u.output_tokens);
+        const i = num2(u.input_tokens);
+        const cr = num2(u.cache_read_input_tokens);
+        const dur = endMs >= pendingStart ? endMs - pendingStart : 0;
+        if (endMs >= sinceMs && o > 0) {
+          out.push({
+            ts: endMs,
+            model: e.message.model ?? "unknown",
+            inputTokens: i,
+            outputTokens: o,
+            cacheReadTokens: cr,
+            durationMs: dur,
+            outputRate: dur > 0 ? (o / dur) * 1000 : 0,
+            startTs: pendingStart,
+          });
+        }
+        pendingStart = undefined;
       }
     }
   }

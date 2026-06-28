@@ -2,7 +2,7 @@
   "name": "claude-monitor",
   "displayName": "Claude Monitor",
   "description": "🇨🇳 Claude Code 实时状态栏监控 | 🇬🇧 Real-time status bar monitor for Claude Code — model, context, rate, TTFT, retry detection, multi-session",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publisher": "xuehun",
   "license": "MIT",
   "repository": {
