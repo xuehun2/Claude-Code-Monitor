@@ -215,7 +215,7 @@ export class Dashboard {
   const $ = (id) => document.getElementById(id);
 
   function setBar(barEl, pct) {
-    barEl.className = "ctxbar" + (pct >= 0.8 ? " high" : "");
+    barEl.className = "ctxbar" + (pct >= 0.85 ? " high" : "");
     barEl.firstElementChild.style.width = Math.min(100, Math.round(pct*100)) + "%";
   }
 

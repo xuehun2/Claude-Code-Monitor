@@ -57,12 +57,10 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     vscode.commands.registerCommand("claudeMonitor.showDashboard", (sessionId?: string) => {
       if (sessionId) {
-        // Pin dashboard to a specific session (clicked from a status bar).
         dashboard.currentSessionId = sessionId;
       }
       const v = sessionId ? service?.views.get(sessionId) : service?.mostRecentView();
-      dashboard.show(v?.state ?? service?.state);
-      // If switching sessions, tell the dashboard to re-fetch stats.
+      dashboard.show(v?.state);
       if (sessionId && dashboard.visible) {
         dashboard.refreshStats();
       }
@@ -92,7 +90,6 @@ interface SessionView {
   cachedEntries: TranscriptEntry[];
   cachedMtime: number | undefined;
   state: MonitorState | undefined;
-  // Flicker fix caches.
   lastText: string;
   lastTooltipStr: string;
   lastBgKey: string;
@@ -115,7 +112,6 @@ class MonitorService implements vscode.Disposable {
     this.projectsDir = resolveProjectsDir(
       getConfig().get<string>("projectsDir")
     );
-    // ~/.claude (parent of projects) — used for sessions/ discovery.
     this.claudeDir = path.dirname(this.projectsDir);
 
     this.logTailer = new LogTailer(defaultCodeLogsDir());
@@ -129,7 +125,6 @@ class MonitorService implements vscode.Disposable {
             getConfig().get<string>("projectsDir")
           );
           this.claudeDir = path.dirname(this.projectsDir);
-          // invalidate caches
           for (const v of this.views.values()) {
             v.cachedMtime = undefined;
           }
@@ -139,17 +134,7 @@ class MonitorService implements vscode.Disposable {
   }
 
   get state(): MonitorState | undefined {
-    // Return the most recently active session's state (for the dashboard).
-    let best: SessionView | undefined;
-    for (const v of this.views.values()) {
-      if (!v.state) {
-        continue;
-      }
-      if (!best || (v.state.updatedAtMs > (best.state?.updatedAtMs ?? 0))) {
-        best = v;
-      }
-    }
-    return best?.state;
+    return this.mostRecentView()?.state;
   }
 
   start(): void {
@@ -195,7 +180,6 @@ class MonitorService implements vscode.Disposable {
       vscode.window.showInformationMessage("No active Claude Code session.");
       return;
     }
-    // open the transcript of the most recently active session
     const v = this.mostRecentView();
     if (v?.active.transcriptPath) {
       vscode.commands.executeCommand(
@@ -215,7 +199,6 @@ class MonitorService implements vscode.Disposable {
   /** Distinct model names seen in the current session's transcript. */
   getModels(): string[] {
     const set = new Set<string>();
-    // Only collect models from the current (dashboard) session
     const sid = this.dashboard.currentSessionId;
     const v = sid ? this.views.get(sid) : this.mostRecentView();
     const tp = v?.active.transcriptPath;
@@ -230,14 +213,11 @@ class MonitorService implements vscode.Disposable {
   /**
    * Compute a chartable dataset for the statistics view.
    * Scoped to the current session only.
-   *   model: "all" | model name
-   *   metric: "input" | "output" | "rate" | "duration"
    */
   computeStats(
     model: string,
     metric: string
   ): StatsResult {
-    // Only collect requests from the current session's transcript.
     const sid = this.dashboard.currentSessionId;
     const v = sid ? this.views.get(sid) : this.mostRecentView();
     const tp = v?.active.transcriptPath;
@@ -258,7 +238,6 @@ class MonitorService implements vscode.Disposable {
       unit = "ms";
       points = rs.map((r) => ({ ts: r.ts, value: r.durationMs, req: r }));
     } else {
-      // rate (default)
       unit = "t/s";
       points = rs.map((r) => ({ ts: r.ts, value: r.outputRate, req: r }));
     }
@@ -323,7 +302,7 @@ class MonitorService implements vscode.Disposable {
       }
     }
 
-    // If no active sessions at all, hide everything (nothing to show).
+    // If no active sessions at all, hide everything.
     if (this.views.size === 0) {
       return;
     }
@@ -343,7 +322,7 @@ class MonitorService implements vscode.Disposable {
           entries = v.cachedEntries;
         }
       } else {
-        entries = []; // no transcript yet (session just started)
+        entries = [];
       }
 
       const state = computeState(entries, {
@@ -357,7 +336,12 @@ class MonitorService implements vscode.Disposable {
       const logSession = logSummary.sessions.get(v.sessionId);
       state.title = logSession?.title;
       mergeLogState(state, logSession ? { available: logSummary.available, ...logSession } : undefined, now);
-      this.render(v, state, show);
+
+      // Hide status bar for brand-new sessions that haven't sent any real
+      // request yet (idle + no completed requests). The bar appears as soon
+      // as the first request starts (phase changes from idle) or completes.
+      const hasRealActivity = state.phase !== "idle" || state.requestCount > 0;
+      this.render(v, state, show && hasRealActivity);
     }
 
     // Dashboard: update whichever session the dashboard is currently showing.
@@ -485,7 +469,7 @@ function statusText(s: MonitorState): string {
   } else if (s.phase === "interrupted") {
     slot = ` ⏹interrupted`;
   }
-  if (s.contextPct > 0.95) {
+  if (s.contextPct > 0.85) {
     slot += ` ⚠compact!`;
   }
 
@@ -499,7 +483,7 @@ function statusBgKey(s: MonitorState): "warning" | "error" | "none" {
   if (s.phase === "interrupted") {
     return "error";
   }
-  if (s.contextPct > 0.95) {
+  if (s.contextPct > 0.85) {
     return "error";
   }
   return "none";
@@ -544,8 +528,8 @@ function statusTooltip(s: MonitorState): string {
   }
   lines.push(`- **Model:** ${s.model ?? "—"}${s.serviceTier ? ` (${s.serviceTier}` : ""}${s.speed ? `, ${s.speed}` : ""}${s.serviceTier ? ")" : ""}`);
   lines.push(`- **Context:** ${fmtTokens(s.contextTokens)} / ${fmtTokens(s.contextLimit)} (${(s.contextPct * 100).toFixed(1)}%)`);
-  if (s.contextPct > 0.95) {
-    lines.push(`  - ⚠ **Context critically high!** Run \`/compact\` to free space.`);
+  if (s.contextPct > 0.85) {
+    lines.push(`  - ⚠ **Context high!** Run \`/compact\` to free space.`);
   }
   if (s.lastRequest) {
     lines.push(`- **Last request:** ${fmtMs(s.lastRequest.durationMs)} · ${fmtRate(s.lastRequest.outputRate)} · ${fmtTokens(s.lastRequest.outputTokens)} out · stop=${s.lastRequest.stopReason ?? "—"}`);

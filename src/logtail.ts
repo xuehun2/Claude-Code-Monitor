@@ -247,14 +247,21 @@ export class LogTailer implements vscode.Disposable {
       return; // update_session_state already gives us titled sessions reliably
     }
 
-    // 3) interrupt_claude — attribute to the current running session.
+    // 3) interrupt_claude — only mark interrupted if the running session is
+    //    actually mid-request (has a requestSentAtMs). Tab switches fire
+    //    interrupt_claude with a mismatched channelId, but those happen when
+    //    no real API request is in flight, so requestSentAtMs is stale/absent.
+    //    A genuine user interrupt (pressing Esc) always happens while a
+    //    request is active.
     if (line.includes('"interrupt_claude"')) {
       const sid = this.lastRunningSessionId;
       if (sid) {
-        const s = this.getOrCreate(sid);
-        s.interrupted = true;
-        s.interruptedAtMs = ts;
-        s.running = false;
+        const s = this.sessions.get(sid);
+        if (s && s.running && s.requestSentAtMs && (ts - s.requestSentAtMs) < 300_000) {
+          s.interrupted = true;
+          s.interruptedAtMs = ts;
+          s.running = false;
+        }
       }
       return;
     }

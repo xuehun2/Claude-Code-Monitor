@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.3.3 (2026-07-01)
+
+### 🐛 Bug 修复
+
+- **切换窗口误标 interrupted** — `interrupt_claude` 日志事件的 channelId 与 `launch_claude` 不匹配，导致切换 Claude Code 标签页时错误地将正在运行的会话标记为 interrupted。现在 `interrupt_claude` 只在会话确实有活跃 API 请求（`requestSentAtMs` 存在且在 5 分钟内）时才标记 interrupted，切窗口不再误触发
+- **新窗口初始化时显示空状态栏** — 新开 Claude Code 窗口时，会话尚未发出任何请求就显示一个无意义的状态栏。现在只有会话实际产生请求（phase 非 idle 或 requestCount > 0）后才显示状态栏
+
+### ⚠️ 已知限制（未实现）
+
+- **单标签页内切换会话无法自动切换状态栏** — Claude Code 在同一标签页内切换会话时，`launch_claude` 和 `interrupt_claude` 的 channelId 机制无法可靠追踪哪个会话在前台，多次尝试均未成功实现自动切换，暂时放弃此功能
+- **手动关闭/隐藏单个状态栏** — 原计划为每个状态栏添加关闭按钮，但因 VS Code 状态栏 API 限制（多个 close 按钮排列丑陋、关闭后切回不恢复），实现效果不佳，已回退
+
+## 0.3.2 (2026-06-30)
+
+### ✨ 新功能
+
+- **多状态栏 + 焦点会话高亮** — 每个 Claude Code 会话对应一个独立状态栏，当前聚焦的会话（通过 `get_session_request` 日志事件检测）以 `prominentBackground` 高亮显示，一眼区分活跃会话
+- **compact 警告阈值调整为 85%** — 上下文使用超过 85% 即显示红色警告和 `⚠compact!` 提示（原 95%）
+
+### 🐛 Bug 修复
+
+- **修复 extension.ts 中间状态** — 修复上一版本中 `SessionView` 接口与 `tick()` 逻辑不一致的问题，恢复每个会话独立状态栏的正确行为
+
+## 0.3.1 (2026-06-30)
+
+### 🐛 Bug 修复
+
+- **长时间空闲会话误显示 interrupted** — 修复 interrupt 标志一旦设置就永久保留的问题。interrupt 现在是瞬时信号，60 秒后自动清除，长空闲会话恢复为 idle 状态
+- **默认会话状态栏无法移除** — 新增手动隐藏状态栏功能
+
+### ✨ 新功能
+
+- **Hide Status Bar for a Session** — 命令面板选择要隐藏的会话状态栏（`Claude Monitor: Hide Status Bar for a Session`）
+- **Restore All Hidden Status Bars** — 一键恢复所有已隐藏的状态栏（`Claude Monitor: Restore All Hidden Status Bars`）
+
 ## 0.3.0 (2026-06-29)
 
 ### 🎨 统计图表重构
