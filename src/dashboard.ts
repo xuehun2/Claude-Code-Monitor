@@ -7,6 +7,8 @@ export class Dashboard {
   private panel: vscode.WebviewPanel | undefined;
   private readonly extUri: vscode.Uri;
   private lastState: MonitorState | undefined;
+  /** Signature of last state update — used to skip redundant postMessage. */
+  private lastSig = "";
   /** SessionId the dashboard is currently pinned to (undefined = follow most recent). */
   currentSessionId: string | undefined;
   /** Handler for messages coming from the webview (stats requests). */
@@ -40,6 +42,8 @@ export class Dashboard {
       this.panel.onDidDispose(() => {
         this.panel = undefined;
         this.currentSessionId = undefined;
+        this.lastSig = "";
+        this.onPanelClosed?.();
       });
     }
     if (state) {
@@ -56,6 +60,17 @@ export class Dashboard {
     if (this.currentSessionId && state.sessionId && state.sessionId !== this.currentSessionId) {
       return;
     }
+
+    // Skip redundant updates: if idle and the meaningful fields haven't
+    // changed since the last update, don't postMessage — avoids rebuilding
+    // the webview DOM every second when nothing is happening.
+    const sig = stateSig(state);
+    const isIdle = state.phase === "idle";
+    if (isIdle && this.lastSig === sig && this.lastState) {
+      this.lastState = state;
+      return;
+    }
+    this.lastSig = sig;
     this.lastState = state;
     if (this.panel) {
       this.panel.title = `Claude Monitor · ${state.title ?? state.sessionId?.slice(0, 8) ?? ""}`;
@@ -75,6 +90,9 @@ export class Dashboard {
   refreshStats(): void {
     this.panel?.webview.postMessage({ type: "refreshStats" });
   }
+
+  /** Clear cached stats data — called when the dashboard panel is closed. */
+  onPanelClosed: (() => void) | undefined;
 
   private getHtml(): string {
     const nonce = getNonce();
@@ -191,6 +209,17 @@ export class Dashboard {
       <option value="rate" selected>速率 Rate</option>
       <option value="duration">会话时间 Duration</option>
     </select></label>
+    <label>时间范围 Time Range <select id="f-range">
+      <option value="all">全部 All</option>
+      <option value="1h">最近1h</option>
+      <option value="6h">最近6h</option>
+      <option value="24h">最近24h</option>
+      <option value="7d">最近7天</option>
+      <option value="30d">最近30天</option>
+      <option value="custom">自定义 Custom</option>
+    </select></label>
+    <label id="custom-range-label" style="display:none">从 From <input type="datetime-local" id="f-from" style="background:var(--vscode-dropdown-background);color:var(--vscode-dropdown-foreground);border:1px solid var(--vscode-dropdown-border,var(--vscode-editorWidget-border,#444));border-radius:4px;padding:3px 6px;font-size:12px;font-family:inherit;" /></label>
+    <label id="custom-range-to" style="display:none">至 To <input type="datetime-local" id="f-to" style="background:var(--vscode-dropdown-background);color:var(--vscode-dropdown-foreground);border:1px solid var(--vscode-dropdown-border,var(--vscode-editorWidget-border,#444));border-radius:4px;padding:3px 6px;font-size:12px;font-family:inherit;" /></label>
   </div>
   <div class="sumgrid" id="sumgrid"></div>
   <div class="chartouter">
@@ -206,7 +235,7 @@ export class Dashboard {
 
   <h1 style="margin-top:18px">Recent requests</h1>
   <table>
-    <thead><tr><th>#</th><th>Model</th><th>Context</th><th>Out</th><th>Dur</th><th>Rate</th><th>Stop</th></tr></thead>
+    <thead><tr><th>#</th><th>Time</th><th>Model</th><th>Context</th><th>Out</th><th>Dur</th><th>Rate</th><th>Stop</th></tr></thead>
     <tbody id="rows"></tbody>
   </table>
 
@@ -233,56 +262,36 @@ export class Dashboard {
   }
 
   function requestStats() {
-    vscode.postMessage({ type:'requestStats', model: $('f-model').value, metric: $('f-metric').value });
+    const range = $('f-range').value;
+    let fromMs = 0;
+    let toMs = 0;
+    const now = Date.now();
+    if (range === '1h') { fromMs = now - 3600000; }
+    else if (range === '6h') { fromMs = now - 6 * 3600000; }
+    else if (range === '24h') { fromMs = now - 86400000; }
+    else if (range === '7d') { fromMs = now - 7 * 86400000; }
+    else if (range === '30d') { fromMs = now - 30 * 86400000; }
+    else if (range === 'custom') {
+      const fromVal = $('f-from').value;
+      const toVal = $('f-to').value;
+      fromMs = fromVal ? new Date(fromVal).getTime() : 0;
+      toMs = toVal ? new Date(toVal).getTime() : 0;
+    }
+    // 'all' → fromMs=0, toMs=0 (no filter)
+    vscode.postMessage({ type:'requestStats', model: $('f-model').value, metric: $('f-metric').value, fromMs, toMs });
   }
-  ['f-model','f-metric'].forEach(id => { $(id).addEventListener('change', requestStats); });
+
+  function toggleCustomRange() {
+    const show = $('f-range').value === 'custom';
+    $('custom-range-label').style.display = show ? '' : 'none';
+    $('custom-range-to').style.display = show ? '' : 'none';
+  }
+
+  ['f-model','f-metric','f-range'].forEach(id => { $(id).addEventListener('change', () => { toggleCustomRange(); requestStats(); }); });
+  $('f-from').addEventListener('change', requestStats);
+  $('f-to').addEventListener('change', requestStats);
   // Hide tooltip when scrolling the chart
   $('chartscroll').addEventListener('scroll', hideTooltip);
-
-  /**
-   * Compute smart X-axis time tick positions.
-   * Returns an array of { ts, label } where ts is the timestamp and label
-   * is the formatted time string.
-   */
-  function computeXTicks(points) {
-    if (!points.length) return [];
-    const minTs = points[0].ts;
-    const maxTs = points[points.length - 1].ts;
-    const span = maxTs - minTs;
-    if (span <= 0) return [{ ts: minTs, label: fmtTime(minTs) }];
-
-    // Choose interval based on span
-    const intervals = [
-      60_000,       // 1 min
-      5 * 60_000,   // 5 min
-      10 * 60_000,  // 10 min
-      30 * 60_000,  // 30 min
-      3600_000,     // 1 hour
-      3 * 3600_000, // 3 hours
-      6 * 3600_000, // 6 hours
-      12 * 3600_000,// 12 hours
-      86400_000,    // 1 day
-    ];
-    // Aim for ~4-8 ticks
-    let interval = intervals[intervals.length - 1];
-    for (const iv of intervals) {
-      if (span / iv <= 8) { interval = iv; break; }
-    }
-
-    const ticks = [];
-    const start = Math.ceil(minTs / interval) * interval;
-    for (let t = start; t <= maxTs; t += interval) {
-      ticks.push({ ts: t, label: fmtTime(t) });
-    }
-    // Always include first and last if they'd be missed
-    if (ticks.length === 0 || ticks[0].ts - minTs > interval * 0.3) {
-      ticks.unshift({ ts: minTs, label: fmtTime(minTs) });
-    }
-    if (ticks.length === 0 || maxTs - ticks[ticks.length-1].ts > interval * 0.3) {
-      ticks.push({ ts: maxTs, label: fmtTime(maxTs) });
-    }
-    return ticks;
-  }
 
   function fmtTime(ts) {
     const d = new Date(ts);
@@ -295,6 +304,53 @@ export class Dashboard {
     const now = new Date();
     const isToday = d.toDateString() === now.toDateString();
     return isToday ? h+':'+m+':'+s : mo+'/'+day+' '+h+':'+m;
+  }
+
+  /**
+   * Format a time label for X-axis, showing date when it changes.
+   * Returns { text, priority } where priority indicates visual importance.
+   *   priority 3 = date change (always shown, even if crowded)
+   *   priority 2 = hour boundary (shown if enough space)
+   *   priority 1 = 10-min boundary (shown if enough space)
+   *   priority 0 = skip
+   */
+  function fmtAxisLabel(ts, prevTs) {
+    const d = new Date(ts);
+    const h = d.getHours();
+    const m = d.getMinutes();
+    const mo = String(d.getMonth()+1).padStart(2,'0');
+    const day = String(d.getDate()).padStart(2,'0');
+    const hh = String(h).padStart(2,'0');
+    const mm = String(m).padStart(2,'0');
+
+    let text = '';
+    let priority = 0;
+
+    if (!prevTs) {
+      const now = new Date();
+      const isToday = d.toDateString() === now.toDateString();
+      text = isToday ? hh+':'+mm : mo+'/'+day+' '+hh+':'+mm;
+      priority = 3; // first point: always show
+      return { text, priority };
+    }
+
+    const prev = new Date(prevTs);
+    const dayChanged = d.toDateString() !== prev.toDateString();
+    const hourChanged = h !== prev.getHours();
+    const minuteChanged = Math.floor(m / 10) !== Math.floor(prev.getMinutes() / 10);
+
+    if (dayChanged) {
+      text = mo+'/'+day+' '+hh+':'+mm;
+      priority = 3; // date change: always show
+    } else if (hourChanged) {
+      text = hh+':'+mm;
+      priority = 2; // hour boundary
+    } else if (minuteChanged) {
+      text = hh+':'+mm;
+      priority = 1; // 10-min boundary
+    }
+
+    return { text, priority };
   }
 
   function fmtTimeFull(ts) {
@@ -407,25 +463,79 @@ export class Dashboard {
       bars.appendChild(b);
     });
 
-    // X-axis time ticks
-    const ticks = computeXTicks(points);
-    const tsMin = points[0].ts;
-    const tsMax = points[points.length - 1].ts;
-    const tsSpan = tsMax - tsMin || 1;
-    ticks.forEach(t => {
-      const pct = ((t.ts - tsMin) / tsSpan) * 100;
-      // Tick line
+    // X-axis: smart time labels at date changes, hour boundaries, etc.
+    // Walk through all bars and place labels only at significant time transitions.
+    // All labels must respect minimum pixel spacing. Date changes (priority 3)
+    // are the most important — if a date change is too close to the previous
+    // label, it REPLACES the previous label (date info is more important).
+    const minLabelPx = 56; // minimum pixels between label centers
+    const minLabelEvery = Math.max(1, Math.ceil(minLabelPx / barSlot));
+    // Track placed labels as { idx, element refs } so we can remove/replace.
+    const placedLabels = [];
+    let prevTs = 0;
+
+    for (let idx = 0; idx < points.length; idx++) {
+      const p = points[idx];
+      const label = fmtAxisLabel(p.ts, prevTs);
+      prevTs = p.ts;
+
+      // Skip if not significant
+      if (label.priority === 0) continue;
+
+      const barCenter = idx * barSlot + barSlot / 2;
+      const tooClose = placedLabels.length > 0 && idx - placedLabels[placedLabels.length - 1].idx < minLabelEvery;
+
+      if (tooClose) {
+        // Only date change (priority 3) can replace the previous label.
+        if (label.priority < 3) continue;
+        // Date change: remove the previous label and replace with this one.
+        const prev = placedLabels.pop();
+        prev.tick.remove();
+        prev.lbl.remove();
+      }
+
+      // Place the label.
       const tick = document.createElement('div');
       tick.className = 'xtick';
-      tick.style.left = pct + '%';
+      tick.style.left = barCenter + 'px';
       xaxis.appendChild(tick);
-      // Label
       const lbl = document.createElement('div');
       lbl.className = 'xlabel';
-      lbl.style.left = pct + '%';
-      lbl.textContent = t.label;
+      lbl.style.left = barCenter + 'px';
+      lbl.textContent = label.text;
+      if (label.priority >= 2) {
+        lbl.style.fontWeight = '600';
+        lbl.style.opacity = '.7';
+      }
       xaxis.appendChild(lbl);
-    });
+      placedLabels.push({ idx, tick, lbl });
+    }
+
+    // Always label the last bar if it's not already labeled, but only if
+    // there's enough space from the previous label.
+    if (points.length > 0) {
+      const lastIdx = points.length - 1;
+      const alreadyLabeled = placedLabels.length > 0 && placedLabels[placedLabels.length - 1].idx === lastIdx;
+      const tooClose = placedLabels.length > 0 && lastIdx - placedLabels[placedLabels.length - 1].idx < minLabelEvery;
+      if (!alreadyLabeled && !tooClose) {
+        const barCenter = lastIdx * barSlot + barSlot / 2;
+        const d = new Date(points[lastIdx].ts);
+        const now = new Date();
+        const isToday = d.toDateString() === now.toDateString();
+        const text = isToday
+          ? String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0')
+          : String(d.getMonth()+1).padStart(2,'0')+'/'+String(d.getDate()).padStart(2,'0')+' '+String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');
+        const tick = document.createElement('div');
+        tick.className = 'xtick';
+        tick.style.left = barCenter + 'px';
+        xaxis.appendChild(tick);
+        const lbl = document.createElement('div');
+        lbl.className = 'xlabel';
+        lbl.style.left = barCenter + 'px';
+        lbl.textContent = text;
+        xaxis.appendChild(lbl);
+      }
+    }
   }
 
   window.addEventListener('message', e => {
@@ -459,7 +569,7 @@ export class Dashboard {
       const rows = $('rows'); rows.innerHTML = '';
       (s.history || []).forEach(r => {
         const tr = document.createElement('tr');
-        tr.innerHTML = '<td>'+r.idx+'</td><td>'+esc(r.model)+'</td><td>'+r.ctx+'</td><td>'+r.out+
+        tr.innerHTML = '<td>'+r.idx+'</td><td class="muted">'+esc(r.time)+'</td><td>'+esc(r.model)+'</td><td>'+r.ctx+'</td><td>'+r.out+
           '</td><td>'+r.dur+'</td><td>'+r.rate+'</td><td class="muted">'+esc(r.stop||'')+'</td>';
         rows.appendChild(tr);
       });
@@ -473,6 +583,30 @@ export class Dashboard {
 </body>
 </html>`;
   }
+}
+
+/**
+ * Compute a lightweight signature of a MonitorState for change detection.
+ * Only includes fields that would produce visible changes in the dashboard
+ * when the monitor is idle — avoids the expensive history/requests array.
+ */
+function stateSig(s: MonitorState): string {
+  return [
+    s.phase,
+    s.model,
+    s.contextTokens,
+    s.contextPct,
+    s.lastRequest?.endMs ?? "",
+    s.lastRequest?.outputRate ?? "",
+    s.requestCount,
+    s.totalOutputTokens,
+    s.totalInputTokens,
+    s.retrying ? "1" : "0",
+    s.retryAttempt ?? "",
+    s.retryCode ?? "",
+    s.liveElapsedMs < 1000 ? 0 : Math.floor(s.liveElapsedMs / 1000), // 1s granularity
+    s.title ?? "",
+  ].join("|");
 }
 
 function getNonce(): string {
@@ -505,7 +639,7 @@ interface DashboardPayload {
   totalSub: string;
   rates: number[];
   history: {
-    idx: number; model: string; ctx: string; out: string;
+    idx: number; time: string; model: string; ctx: string; out: string;
     dur: string; rate: string; stop?: string;
   }[];
 }
@@ -588,6 +722,7 @@ function toPayload(s: MonitorState): DashboardPayload {
     history: s.requests
       .map((r, i) => ({
         idx: i + 1,
+        time: r.endMs ? new Date(r.endMs).toLocaleString() : "",
         model: r.model,
         ctx: fmtTokens(r.contextTokens),
         out: fmtTokens(r.outputTokens),

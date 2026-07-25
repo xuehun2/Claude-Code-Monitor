@@ -1,5 +1,9 @@
 // Types describing the parts of the Claude Code transcript JSONL we care about,
 // plus the derived monitor state shown in the status bar / dashboard.
+//
+// computeState() supports incremental computation: when only a few new entries
+// have been appended since the last call, pass the previous ComputeAccumulator
+// to avoid re-traversing the entire entries array.
 
 export interface Usage {
   input_tokens?: number;
@@ -126,6 +130,40 @@ export interface ComputeOptions {
   nowMs: number;
 }
 
+/**
+ * Accumulator for incremental computeState. Stores the intermediate state
+ * between calls so that only newly appended entries need to be processed.
+ * When the entries array is replaced (truncation/re-read), pass no accumulator
+ * to do a full recomputation.
+ */
+export interface ComputeAccumulator {
+  /** How many entries from the entries array have already been processed. */
+  processedCount: number;
+
+  // --- intermediate state carried across calls ---
+  pendingStartMs: number | undefined;
+  lastUserMs: number | undefined;
+  lastErrorText: string | undefined;
+  lastErrorMs: number | undefined;
+  sawApiError: boolean;
+
+  // --- accumulated results (updated incrementally) ---
+  model: string | undefined;
+  serviceTier: string | undefined;
+  speed: string | undefined;
+  contextTokens: number;
+  sessionId: string | undefined;
+  cwd: string | undefined;
+  version: string | undefined;
+  gitBranch: string | undefined;
+  entrypoint: string | undefined;
+
+  /** All request records (untrimmed). Only the last maxHistory are kept in state. */
+  allRequests: RequestRecord[];
+  totalOutputTokens: number;
+  totalInputTokens: number;
+}
+
 function tsToMs(s: string | undefined): number | undefined {
   if (!s) {
     return undefined;
@@ -139,73 +177,65 @@ function num(n: unknown): number {
 }
 
 /**
- * Reduce a list of transcript entries (already parsed, in file order) to a
- * MonitorState. Each assistant message with usage is treated as one model
- * request; its start time is the timestamp of the most recent preceding
- * user/tool-result entry.
+ * Create a fresh (empty) accumulator.
  */
-export function computeState(
-  entries: TranscriptEntry[],
-  opts: ComputeOptions
-): MonitorState {
-  const state: MonitorState = {
-    source: "transcript",
+function freshAccumulator(): ComputeAccumulator {
+  return {
+    processedCount: 0,
+    pendingStartMs: undefined,
+    lastUserMs: undefined,
+    lastErrorText: undefined,
+    lastErrorMs: undefined,
+    sawApiError: false,
+    model: undefined,
+    serviceTier: undefined,
+    speed: undefined,
     contextTokens: 0,
-    contextLimit: opts.contextLimit,
-    contextPct: 0,
-    requests: [],
-    requestCount: 0,
+    sessionId: undefined,
+    cwd: undefined,
+    version: undefined,
+    gitBranch: undefined,
+    entrypoint: undefined,
+    allRequests: [],
     totalOutputTokens: 0,
     totalInputTokens: 0,
-    inFlight: false,
-    inFlightElapsedMs: 0,
-    retrying: false,
-    running: false,
-    interrupted: false,
-    phase: "idle",
-    liveElapsedMs: 0,
-    logAvailable: false,
-    updatedAtMs: opts.nowMs,
   };
+}
 
-  if (entries.length === 0) {
-    state.source = "none";
-    return state;
-  }
+/**
+ * Process a batch of entries and update the accumulator in place.
+ * Returns the updated accumulator (same reference, mutated).
+ */
+function processEntries(
+  acc: ComputeAccumulator,
+  entries: TranscriptEntry[],
+  startIdx: number,
+  endIdx: number,
+): ComputeAccumulator {
+  for (let i = startIdx; i < endIdx; i++) {
+    const e = entries[i];
 
-  let pendingStartMs: number | undefined; // start time of the request currently in flight
-  let lastUserMs: number | undefined; // timestamp of the last user-type entry
-  let lastErrorText: string | undefined; // text of the most recent API error
-  let lastErrorMs: number | undefined; // timestamp of the most recent API error
-  let sawApiError = false; // any isApiErrorMessage entry exists in this session
-
-  const requests: RequestRecord[] = [];
-
-  for (const e of entries) {
     // Carry session metadata from any entry that has it.
-    state.sessionId ??= e.sessionId;
-    state.cwd ??= e.cwd;
-    state.version ??= e.version;
-    state.gitBranch ??= e.gitBranch;
-    state.entrypoint ??= e.entrypoint;
+    acc.sessionId ??= e.sessionId;
+    acc.cwd ??= e.cwd;
+    acc.version ??= e.version;
+    acc.gitBranch ??= e.gitBranch;
+    acc.entrypoint ??= e.entrypoint;
 
     const eMs = tsToMs(e.timestamp);
 
     if (e.type === "user") {
-      // An API-error entry is a real, explicit signal that a model request's
-      // retries were exhausted and the error was surfaced. Capture its text.
       if (e.isApiErrorMessage) {
-        sawApiError = true;
-        lastErrorMs = eMs ?? lastErrorMs;
+        acc.sawApiError = true;
+        acc.lastErrorMs = eMs ?? acc.lastErrorMs;
         const text = stringifyContent(e.message?.content);
-        lastErrorText = text || "API error";
-        // An error entry is NOT a new in-flight model request start.
+        acc.lastErrorText = text || "API error";
         continue;
       }
       const ms = eMs;
       if (ms !== undefined) {
-        lastUserMs = ms;
-        pendingStartMs = ms;
+        acc.lastUserMs = ms;
+        acc.pendingStartMs = ms;
       }
       continue;
     }
@@ -221,32 +251,25 @@ export function computeState(
       const contextTokens = inputTokens + cacheRead + cacheCreation;
 
       if (e.message.model) {
-        state.model = e.message.model;
+        acc.model = e.message.model;
       }
       if (usage?.service_tier) {
-        state.serviceTier = usage.service_tier;
+        acc.serviceTier = usage.service_tier;
       }
       if (usage?.speed) {
-        state.speed = usage.speed;
+        acc.speed = usage.speed;
       }
-      // Only update context when we have real data (>0). Some assistant
-      // entries (e.g. tool-result responses, sub-agent calls) carry zero
-      // usage — we must not overwrite a valid context reading with 0.
       if (contextTokens > 0) {
-        state.contextTokens = contextTokens;
+        acc.contextTokens = contextTokens;
       }
 
-      // Only emit a request record when a user/tool-result entry preceded
-      // this one AND the request has meaningful output (outputTokens > 0 or
-      // a real duration). Entries with zero usage produce meaningless rate
-      // and context readings — skip them.
-      if (pendingStartMs !== undefined && outputTokens > 0) {
-        const startMs = pendingStartMs;
+      if (acc.pendingStartMs !== undefined && outputTokens > 0) {
+        const startMs = acc.pendingStartMs;
         const durationMs = endMs >= startMs ? endMs - startMs : 0;
         const outputRate =
           durationMs > 0 ? (outputTokens / durationMs) * 1000 : 0;
-        requests.push({
-          model: e.message.model ?? state.model ?? "unknown",
+        const req: RequestRecord = {
+          model: e.message.model ?? acc.model ?? "unknown",
           startMs,
           endMs,
           durationMs,
@@ -257,36 +280,71 @@ export function computeState(
           contextTokens,
           outputRate,
           stopReason: e.message.stop_reason,
-        });
-        pendingStartMs = undefined; // consumed
+        };
+        acc.allRequests.push(req);
+        acc.totalOutputTokens += outputTokens;
+        acc.totalInputTokens += contextTokens;
+        acc.pendingStartMs = undefined; // consumed
       }
       continue;
     }
 
-    // Other entry types (system init, summary, attachment, queue-operation, ...):
-    // pull model info from system init if present.
     if (e.type === "system" && e.subtype === "init") {
-      // init sometimes carries model under message.model or a top-level field
       const m = (e as Record<string, unknown>).model;
       if (typeof m === "string") {
-        state.model ??= m;
+        acc.model ??= m;
       }
     }
   }
 
+  acc.processedCount = endIdx;
+  return acc;
+}
+
+/**
+ * Build a MonitorState from an accumulator and the full entries array.
+ * This is the "finalize" step — it reads the accumulated values and
+ * computes the derived fields (contextPct, inFlight, trimmed requests, etc.).
+ */
+function buildState(acc: ComputeAccumulator, entries: TranscriptEntry[], opts: ComputeOptions): MonitorState {
+  const state: MonitorState = {
+    source: entries.length === 0 ? "none" : "transcript",
+    contextTokens: acc.contextTokens,
+    contextLimit: opts.contextLimit,
+    contextPct: 0,
+    requests: [],
+    requestCount: acc.allRequests.length,
+    totalOutputTokens: acc.totalOutputTokens,
+    totalInputTokens: acc.totalInputTokens,
+    inFlight: false,
+    inFlightElapsedMs: 0,
+    retrying: false,
+    running: false,
+    interrupted: false,
+    phase: "idle",
+    liveElapsedMs: 0,
+    logAvailable: false,
+    updatedAtMs: opts.nowMs,
+
+    // Carry metadata from accumulator
+    sessionId: acc.sessionId,
+    cwd: acc.cwd,
+    version: acc.version,
+    gitBranch: acc.gitBranch,
+    entrypoint: acc.entrypoint,
+    model: acc.model,
+    serviceTier: acc.serviceTier,
+    speed: acc.speed,
+  };
+
   // Trim to most recent N
+  const all = acc.allRequests;
   const trimmed =
-    requests.length > opts.maxHistory
-      ? requests.slice(requests.length - opts.maxHistory)
-      : requests;
+    all.length > opts.maxHistory
+      ? all.slice(all.length - opts.maxHistory)
+      : all;
   state.requests = trimmed;
-  state.requestCount = requests.length;
-  state.totalOutputTokens = requests.reduce((a, r) => a + r.outputTokens, 0);
-  state.totalInputTokens = requests.reduce(
-    (a, r) => a + r.contextTokens,
-    0
-  );
-  state.lastRequest = requests.length ? requests[requests.length - 1] : undefined;
+  state.lastRequest = all.length ? all[all.length - 1] : undefined;
   state.contextTokens = state.lastRequest
     ? state.lastRequest.contextTokens
     : state.contextTokens;
@@ -296,31 +354,106 @@ export function computeState(
       : 0;
 
   // In-flight: the last non-error user entry had no following assistant
-  // message AND the session didn't end on an API error. If the last entry is
-  // an API error, the request is done (interrupted by error), not generating.
+  // message AND the session didn't end on an API error.
   const lastEntry = entries[entries.length - 1];
   const endedOnError = !!lastEntry?.isApiErrorMessage;
   const inFlight =
     !endedOnError &&
-    lastUserMs !== undefined &&
-    pendingStartMs !== undefined &&
+    acc.lastUserMs !== undefined &&
+    acc.pendingStartMs !== undefined &&
     lastEntry?.type !== "assistant";
   state.inFlight = inFlight;
-  if (inFlight && lastUserMs !== undefined) {
-    state.inFlightElapsedMs = Math.max(0, opts.nowMs - lastUserMs);
+  if (inFlight && acc.lastUserMs !== undefined) {
+    state.inFlightElapsedMs = Math.max(0, opts.nowMs - acc.lastUserMs);
   }
 
-  // Retry / error signal: ONLY the explicit isApiErrorMessage entry.
-  // We do not infer retrying from in-flight duration — long tool runs would
-  // cause false positives, and the user asked for a real attempt signal only.
-  state.lastErrorText = lastErrorText;
-  state.lastErrorMs = lastErrorMs;
-  if (sawApiError && lastErrorText) {
+  // Retry / error signal
+  state.lastErrorText = acc.lastErrorText;
+  state.lastErrorMs = acc.lastErrorMs;
+  if (acc.sawApiError && acc.lastErrorText) {
     state.retrying = true;
-    state.retryReason = truncate(lastErrorText, 120);
+    state.retryReason = truncate(acc.lastErrorText, 120);
   }
 
   return state;
+}
+
+/**
+ * Incrementally compute MonitorState from transcript entries.
+ * If prevAcc is provided and its processedCount matches the start of the
+ * entries array, only the newly appended entries are processed.
+ * If prevAcc is undefined or stale (processedCount > entries.length, meaning
+ * the entries array was replaced), a full recomputation is performed.
+ *
+ * Returns { state, acc } where acc should be passed to the next call.
+ */
+export function computeStateIncremental(
+  entries: TranscriptEntry[],
+  prevAcc: ComputeAccumulator | undefined,
+  opts: ComputeOptions
+): { state: MonitorState; acc: ComputeAccumulator } {
+  // No entries at all — return empty state.
+  if (entries.length === 0) {
+    const acc = freshAccumulator();
+    const state: MonitorState = {
+      source: "none",
+      contextTokens: 0,
+      contextLimit: opts.contextLimit,
+      contextPct: 0,
+      requests: [],
+      requestCount: 0,
+      totalOutputTokens: 0,
+      totalInputTokens: 0,
+      inFlight: false,
+      inFlightElapsedMs: 0,
+      retrying: false,
+      running: false,
+      interrupted: false,
+      phase: "idle",
+      liveElapsedMs: 0,
+      logAvailable: false,
+      updatedAtMs: opts.nowMs,
+    };
+    return { state, acc };
+  }
+
+  // Determine if we can do an incremental update.
+  // If prevAcc exists and its processedCount <= entries.length, we only
+  // need to process entries from processedCount onward.
+  // If processedCount > entries.length, the entries array was replaced
+  // (truncation/re-read) — do a full recomputation.
+  let acc: ComputeAccumulator;
+  let startIdx: number;
+
+  if (prevAcc && prevAcc.processedCount <= entries.length) {
+    // Incremental: reuse previous accumulator, process only new entries.
+    acc = prevAcc;
+    startIdx = acc.processedCount;
+  } else {
+    // Full recomputation: start fresh.
+    acc = freshAccumulator();
+    startIdx = 0;
+  }
+
+  // Process new entries (if any).
+  if (startIdx < entries.length) {
+    processEntries(acc, entries, startIdx, entries.length);
+  }
+
+  const state = buildState(acc, entries, opts);
+  return { state, acc };
+}
+
+/**
+ * Full (non-incremental) computation — processes all entries from scratch.
+ * Kept for backward compatibility and for cases where incremental state
+ * is not available (e.g. collectRequestsFromFile).
+ */
+export function computeState(
+  entries: TranscriptEntry[],
+  opts: ComputeOptions
+): MonitorState {
+  return computeStateIncremental(entries, undefined, opts).state;
 }
 
 /** Shape of a per-session log state from logtail.ts (kept local to avoid a cycle). */

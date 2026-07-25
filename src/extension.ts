@@ -1,8 +1,8 @@
 import * as vscode from "vscode";
 import * as path from "path";
-import type { MonitorState, TranscriptEntry } from "./metrics";
+import type { MonitorState, TranscriptEntry, ComputeAccumulator } from "./metrics";
 import {
-  computeState,
+  computeStateIncremental,
   mergeLogState,
   fmtMs,
   fmtRate,
@@ -11,7 +11,7 @@ import {
 import {
   listSessions,
   pickActiveSession,
-  readEntries,
+  readEntriesIncremental,
   resolveProjectsDir,
   fileMtimeMs,
   listActiveSessions,
@@ -21,6 +21,7 @@ import {
   type SessionInfo,
   type ActiveSession,
   type StatRequest,
+  type IncrementalReadState,
 } from "./transcript";
 import { LogTailer, defaultCodeLogsDir, type PerSessionLogState } from "./logtail";
 import { Dashboard } from "./dashboard";
@@ -42,15 +43,13 @@ export function activate(context: vscode.ExtensionContext): void {
 
   // Webview → extension: statistics requests.
   dashboard.onMessage = (raw) => {
-    if (!service) {
-      return;
-    }
-    const msg = raw as { type?: string; model?: string; metric?: string };
+    if (!service) return;
+    const msg = raw as { type?: string; model?: string; metric?: string; fromMs?: number; toMs?: number };
     if (msg?.type === "getModels") {
-      dashboard.sendModels(service.getModels());
+      void service.getModels().then((models) => dashboard.sendModels(models));
     } else if (msg?.type === "requestStats") {
-      const data = service.computeStats(msg.model ?? "all", msg.metric ?? "rate");
-      dashboard.sendStats(data);
+      void service.computeStats(msg.model ?? "all", msg.metric ?? "rate", msg.fromMs ?? 0, msg.toMs ?? 0)
+        .then((data) => dashboard.sendStats(data));
     }
   };
 
@@ -87,8 +86,10 @@ interface SessionView {
   sessionId: string;
   active: ActiveSession;
   statusItem: vscode.StatusBarItem;
-  cachedEntries: TranscriptEntry[];
-  cachedMtime: number | undefined;
+  /** Incremental read state — tracks file offset and accumulated entries. */
+  readState: IncrementalReadState | undefined;
+  /** Incremental compute accumulator — avoids re-traversing all entries. */
+  computeAcc: ComputeAccumulator | undefined;
   state: MonitorState | undefined;
   lastText: string;
   lastTooltipStr: string;
@@ -107,6 +108,35 @@ class MonitorService implements vscode.Disposable {
   private timer: NodeJS.Timeout | undefined;
   private readonly disposables: vscode.Disposable[] = [];
 
+  /** Debounce: suppress tick() re-entry within this many ms. */
+  private lastTickMs = 0;
+  private readonly tickDebounceMs = 500;
+  /** Guard against concurrent tick() runs (async I/O can overlap). */
+  private ticking = false;
+
+  /** Cache for listActiveSessions — avoid scanning disk every tick. */
+  private cachedActiveSessions: ActiveSession[] = [];
+  private cachedActiveSessionsAt = 0;
+  private readonly activeSessionsTtlMs = 5000;
+
+  /** Cache for stats data — avoid re-reading transcript on every filter change. */
+  private statsCache: {
+    transcriptPath: string;
+    mtime: number;
+    requests: StatRequest[];
+    createdAt: number;
+  } | undefined;
+
+  /** Cache for getModels — avoid re-reading transcript. */
+  private modelsCache: {
+    transcriptPath: string;
+    mtime: number;
+    models: string[];
+  } | undefined;
+
+  /** Max age for stats/models cache — after this, re-read to pick up new data. */
+  private readonly statsCacheTtlMs = 30_000;
+
   constructor(dashboard: Dashboard) {
     this.dashboard = dashboard;
     this.projectsDir = resolveProjectsDir(
@@ -116,7 +146,13 @@ class MonitorService implements vscode.Disposable {
 
     this.logTailer = new LogTailer(defaultCodeLogsDir());
     this.disposables.push(this.logTailer);
-    this.logTailer.onState(() => this.tick());
+    this.logTailer.onState(() => this.scheduleTick());
+
+    // When the dashboard panel is closed, release cached stats data to free memory.
+    this.dashboard.onPanelClosed = () => {
+      this.statsCache = undefined;
+      this.modelsCache = undefined;
+    };
 
     this.disposables.push(
       vscode.workspace.onDidChangeConfiguration((e) => {
@@ -126,8 +162,12 @@ class MonitorService implements vscode.Disposable {
           );
           this.claudeDir = path.dirname(this.projectsDir);
           for (const v of this.views.values()) {
-            v.cachedMtime = undefined;
+            v.readState = undefined; // force re-read
+            v.computeAcc = undefined; // force recompute
           }
+          this.statsCache = undefined;
+          this.modelsCache = undefined;
+          this.cachedActiveSessionsAt = 0;
         }
       })
     );
@@ -138,16 +178,33 @@ class MonitorService implements vscode.Disposable {
   }
 
   start(): void {
-    this.tick();
+    this.lastTickMs = Date.now();
+    void this.tick();
     const interval = Math.max(
       250,
       getConfig().get<number>("refreshIntervalMs") ?? 1000
     );
-    this.timer = setInterval(() => this.tick(), interval);
+    this.timer = setInterval(() => this.scheduleTick(), interval);
+  }
+
+  /**
+   * Schedule a tick with debounce. Coalesces rapid fire from logTailer events
+   * and the polling timer into a single tick — prevents re-reading files many
+   * times per second during streaming output.
+   */
+  private scheduleTick(): void {
+    const now = Date.now();
+    const elapsed = now - this.lastTickMs;
+    if (elapsed >= this.tickDebounceMs) {
+      this.lastTickMs = now;
+      void this.tick();
+    }
+    // Otherwise: a recent tick already ran. The next setInterval tick will
+    // pick up any newer changes.
   }
 
   async pickSession(): Promise<void> {
-    this.sessions = listSessions(this.projectsDir);
+    this.sessions = await listSessions(this.projectsDir);
     if (this.sessions.length === 0) {
       vscode.window.showInformationMessage(
         `No Claude Code transcripts found in ${this.projectsDir}`
@@ -191,40 +248,92 @@ class MonitorService implements vscode.Disposable {
 
   forceRefresh(): void {
     for (const v of this.views.values()) {
-      v.cachedMtime = undefined;
+      v.readState = undefined; // force full re-read
+      v.computeAcc = undefined; // force full recompute
     }
-    this.tick();
+    this.statsCache = undefined;
+    this.modelsCache = undefined;
+    this.cachedActiveSessionsAt = 0; // force re-scan
+    void this.tick();
   }
 
   /** Distinct model names seen in the current session's transcript. */
-  getModels(): string[] {
-    const set = new Set<string>();
+  async getModels(): Promise<string[]> {
     const sid = this.dashboard.currentSessionId;
-    const v = sid ? this.views.get(sid) : this.mostRecentView();
+    let v = sid ? this.views.get(sid) : undefined;
+    if (!v) {
+      v = this.mostRecentView();
+      if (v?.state?.sessionId) {
+        this.dashboard.currentSessionId = v.state.sessionId;
+      }
+    }
     const tp = v?.active.transcriptPath;
-    for (const r of collectRequestsFromFile(tp, 0)) {
+    if (!tp) return [];
+
+    // Use cache if transcript hasn't changed.
+    const mtime = (await fileMtimeMs(tp)) ?? 0;
+    if (this.modelsCache && this.modelsCache.transcriptPath === tp && this.modelsCache.mtime === mtime) {
+      return this.modelsCache.models;
+    }
+
+    const set = new Set<string>();
+    for (const r of await this.getRequestsForStats(tp)) {
       if (r.model) {
         set.add(r.model);
       }
     }
-    return [...set].sort();
+    const models = [...set].sort();
+    this.modelsCache = { transcriptPath: tp, mtime, models };
+    return models;
+  }
+
+  /**
+   * Get all requests for the stats panel from a transcript file, using cache.
+   * This avoids re-reading the entire transcript file on every stats request.
+   * Cache is invalidated by: file mtime change, TTL expiry, or dashboard close.
+   */
+  private async getRequestsForStats(transcriptPath: string): Promise<StatRequest[]> {
+    const mtime = (await fileMtimeMs(transcriptPath)) ?? 0;
+    const now = Date.now();
+    if (
+      this.statsCache &&
+      this.statsCache.transcriptPath === transcriptPath &&
+      this.statsCache.mtime === mtime &&
+      now - this.statsCache.createdAt < this.statsCacheTtlMs
+    ) {
+      return this.statsCache.requests;
+    }
+    const requests = await collectRequestsFromFile(transcriptPath, 0);
+    this.statsCache = { transcriptPath, mtime, requests, createdAt: now };
+    return requests;
   }
 
   /**
    * Compute a chartable dataset for the statistics view.
    * Scoped to the current session only.
    */
-  computeStats(
+  async computeStats(
     model: string,
-    metric: string
-  ): StatsResult {
+    metric: string,
+    fromMs = 0,
+    toMs = 0
+  ): Promise<StatsResult> {
     const sid = this.dashboard.currentSessionId;
-    const v = sid ? this.views.get(sid) : this.mostRecentView();
+    let v = sid ? this.views.get(sid) : undefined;
+    if (!v) {
+      v = this.mostRecentView();
+      if (v?.state?.sessionId) {
+        this.dashboard.currentSessionId = v.state.sessionId;
+      }
+    }
     const tp = v?.active.transcriptPath;
-    const reqs = collectRequestsFromFile(tp, 0);
+    const allReqs = tp ? await this.getRequestsForStats(tp) : [];
+    let rs = allReqs.filter((r) => r.ts >= fromMs && (toMs <= 0 || r.ts <= toMs));
 
     const wantModel = model !== "all";
-    const rs = reqs.filter((r) => !wantModel || r.model === model);
+    if (wantModel) {
+      rs = rs.filter((r) => r.model === model);
+    }
     let unit = "";
     let points: { ts: number; value: number; req: StatRequest }[] = [];
 
@@ -256,9 +365,42 @@ class MonitorService implements vscode.Disposable {
     return { points, summary, unit, metric, model };
   }
 
-  private tick(): void {
+  private async tick(): Promise<void> {
+    // Guard against concurrent ticks — if a previous tick is still awaiting I/O,
+    // skip this one. The next polling timer will try again.
+    if (this.ticking) {
+      return;
+    }
+    this.ticking = true;
+    try {
+      await this._tick();
+    } catch {
+      // ignore tick errors
+    } finally {
+      this.ticking = false;
+    }
+  }
+
+  private async _tick(): Promise<void> {
     const now = Date.now();
-    const active = listActiveSessions(this.claudeDir);
+    // Use cached active sessions if fresh, to avoid scanning the sessions
+    // directory and doing process.kill checks on every tick. When the cache
+    // is empty (e.g. Claude Code not started yet), use a shorter TTL so we
+    // re-scan sooner and pick up newly-created sessions.
+    const emptyCacheTtl = 1000;
+    const ttl = this.cachedActiveSessions.length > 0 ? this.activeSessionsTtlMs : emptyCacheTtl;
+    const useCache = now - this.cachedActiveSessionsAt < ttl;
+    let active: ActiveSession[];
+    if (useCache) {
+      active = this.cachedActiveSessions;
+    } else {
+      active = await listActiveSessions(this.claudeDir);
+      // Only update cache + timestamp when we actually scanned — otherwise
+      // a cached empty result would refresh its own TTL and never expire.
+      this.cachedActiveSessions = active;
+      this.cachedActiveSessionsAt = now;
+    }
+
     const activeIds = new Set(active.map((a) => a.sessionId));
 
     // Remove views for sessions no longer active.
@@ -288,8 +430,8 @@ class MonitorService implements vscode.Disposable {
           sessionId: a.sessionId,
           active: a,
           statusItem,
-          cachedEntries: [],
-          cachedMtime: undefined,
+          readState: undefined,
+          computeAcc: undefined,
           state: undefined,
           lastText: "",
           lastTooltipStr: "",
@@ -303,45 +445,53 @@ class MonitorService implements vscode.Disposable {
     }
 
     // If no active sessions at all, hide everything.
-    if (this.views.size === 0) {
-      return;
-    }
+    if (this.views.size === 0) return;
 
     const cfg = getConfig();
     const show = cfg.get<boolean>("showInStatusBar") !== false;
     const logSummary = this.logTailer.getSummary();
 
+    // Incrementally read all active session transcripts in parallel.
+    const tickEntries = new Map<string, TranscriptEntry[]>();
+    const readPromises: Promise<void>[] = [];
     for (const v of this.views.values()) {
       const tp = v.active.transcriptPath;
-      let entries: TranscriptEntry[] = v.cachedEntries;
       if (tp) {
-        const mtime = fileMtimeMs(tp);
-        if (mtime !== undefined && mtime !== v.cachedMtime) {
-          v.cachedMtime = mtime;
-          v.cachedEntries = readEntries(tp);
-          entries = v.cachedEntries;
-        }
+        readPromises.push(
+          readEntriesIncremental(tp, v.readState).then((newState) => {
+            v.readState = newState;
+            tickEntries.set(v.sessionId, newState.entries);
+          })
+        );
       } else {
-        entries = [];
+        tickEntries.set(v.sessionId, []);
       }
+    }
+    await Promise.all(readPromises);
 
-      const state = computeState(entries, {
+    for (const v of this.views.values()) {
+      const entries = tickEntries.get(v.sessionId) ?? [];
+
+      // Incremental compute: only process new entries since last tick.
+      // When readState was reset (forceRefresh/config change), computeAcc
+      // is also undefined, so this falls back to full computation.
+      const { state, acc } = computeStateIncremental(entries, v.computeAcc, {
         contextLimit: cfg.get<number>("contextLimit") ?? 200000,
         retryThresholdMs: cfg.get<number>("retryThresholdMs") ?? 30000,
         maxHistory: cfg.get<number>("maxHistoryRequests") ?? 40,
         nowMs: now,
       });
-      state.transcriptPath = tp;
+      v.computeAcc = acc;
+      state.transcriptPath = v.active.transcriptPath;
       state.sessionId = v.sessionId;
       const logSession = logSummary.sessions.get(v.sessionId);
       state.title = logSession?.title;
       mergeLogState(state, logSession ? { available: logSummary.available, ...logSession } : undefined, now);
 
-      // Hide status bar for brand-new sessions that haven't sent any real
-      // request yet (idle + no completed requests). The bar appears as soon
-      // as the first request starts (phase changes from idle) or completes.
-      const hasRealActivity = state.phase !== "idle" || state.requestCount > 0;
-      this.render(v, state, show && hasRealActivity);
+      // Always show the status bar for active sessions (the session process
+      // is alive per listActiveSessions). The old check (requestCount > 0)
+      // caused new sessions to be invisible until their first request completed.
+      this.render(v, state, show);
     }
 
     // Dashboard: update whichever session the dashboard is currently showing.
@@ -421,13 +571,9 @@ function getConfig(): vscode.WorkspaceConfiguration {
 
 /** Truncate a session title to 5 chars + "…" (by character count, not bytes). */
 function shortTitle(title: string | undefined): string {
-  if (!title) {
-    return "Claude";
-  }
+  if (!title) return "Claude";
   const chars = Array.from(title.trim());
-  if (chars.length <= 5) {
-    return chars.join("");
-  }
+  if (chars.length <= 5) return chars.join("");
   return chars.slice(0, 5).join("") + "…";
 }
 
@@ -445,7 +591,6 @@ function statusText(s: MonitorState): string {
   const pct = `${(s.contextPct * 100).toFixed(0)}%`;
   const title = shortTitle(s.title);
 
-  // Rate slot: [outTokens · firstByte · rate] for the latest completed request
   let rateSlot = "—";
   if (s.lastRequest) {
     const out = fmtTokens(s.lastRequest.outputTokens);
@@ -477,15 +622,9 @@ function statusText(s: MonitorState): string {
 }
 
 function statusBgKey(s: MonitorState): "warning" | "error" | "none" {
-  if (s.phase === "retrying") {
-    return "warning";
-  }
-  if (s.phase === "interrupted") {
-    return "error";
-  }
-  if (s.contextPct > 0.85) {
-    return "error";
-  }
+  if (s.phase === "retrying") return "warning";
+  if (s.phase === "interrupted") return "error";
+  if (s.contextPct > 0.85) return "error";
   return "none";
 }
 

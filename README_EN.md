@@ -38,8 +38,18 @@ A VS Code extension that provides a **live status bar + dashboard** for [Claude 
 Click the status bar or run `Claude Monitor: Show Live Dashboard` to open the webview panel with:
 
 - Real-time status cards (model / context progress bar / request duration / output rate / live timer)
-- Rate sparkline
+- **Statistics chart**: filterable by model / time range / metric, with Y-axis scale, hover tooltips, and summary cards
 - Recent request history table
+
+### 📊 Statistics Chart Filters
+
+| Filter | Options |
+| --- | --- |
+| Model | All + auto-listed models from session |
+| Time Range | All / Last 1h / 6h / 24h / 7d / 30d / Custom (from-to datetime) |
+| Metric | Input tokens / Output tokens / Rate / Duration |
+
+The chart shows the request sequence within the filtered range, with Y-axis value scale, X-axis time labels precisely aligned with bars, and hover tooltips showing detailed values and timestamps. Summary cards above show count, average, min, max, and total.
 
 ## 📐 How It Works
 

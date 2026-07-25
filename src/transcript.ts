@@ -1,4 +1,7 @@
 // Discover and parse Claude Code transcript JSONL files.
+// All I/O is async to avoid blocking the VS Code extension host thread.
+// For real-time monitoring, readEntriesIncremental() supports incremental
+// reading — only new bytes appended since the last read are fetched and parsed.
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
@@ -25,21 +28,20 @@ export function resolveProjectsDir(override?: string): string {
   return dir;
 }
 
-export function listSessions(projectsDir: string): SessionInfo[] {
+export async function listSessions(projectsDir: string): Promise<SessionInfo[]> {
   const out: SessionInfo[] = [];
-  let top: string[];
+  let top: fs.Dirent[];
   try {
-    top = fs.readdirSync(projectsDir, { withFileTypes: true })
-      .filter((d) => d.isDirectory())
-      .map((d) => d.name);
+    top = (await fs.promises.readdir(projectsDir, { withFileTypes: true }))
+      .filter((d) => d.isDirectory());
   } catch {
     return out;
   }
   for (const sub of top) {
-    const subDir = path.join(projectsDir, sub);
+    const subDir = path.join(projectsDir, sub.name);
     let files: string[];
     try {
-      files = fs.readdirSync(subDir).filter((f) => f.endsWith(".jsonl"));
+      files = (await fs.promises.readdir(subDir)).filter((f) => f.endsWith(".jsonl"));
     } catch {
       continue;
     }
@@ -47,12 +49,12 @@ export function listSessions(projectsDir: string): SessionInfo[] {
       const p = path.join(subDir, f);
       let stat: fs.Stats;
       try {
-        stat = fs.statSync(p);
+        stat = await fs.promises.stat(p);
       } catch {
         continue;
       }
       const sessionId = f.replace(/\.jsonl$/, "");
-      const meta = quickMeta(p);
+      const meta = await quickMeta(p);
       out.push({
         sessionId,
         path: p,
@@ -66,38 +68,192 @@ export function listSessions(projectsDir: string): SessionInfo[] {
   return out;
 }
 
-// Read the first and last few lines to extract session metadata cheaply.
-function quickMeta(p: string): Partial<SessionInfo> {
+// Read the first few lines to extract session metadata cheaply.
+async function quickMeta(p: string): Promise<Partial<SessionInfo>> {
   const meta: Partial<SessionInfo> = {};
+  let fd: fs.promises.FileHandle | undefined;
   try {
-    const fd = fs.openSync(p, "r");
-    try {
-      const headBuf = Buffer.alloc(8192);
-      const n = fs.readSync(fd, headBuf, 0, headBuf.length, 0);
-      const head = headBuf.toString("utf8", 0, n);
-      for (const line of head.split("\n")) {
-        if (!line.trim()) {
-          continue;
+    fd = await fs.promises.open(p, "r");
+    const headBuf = Buffer.alloc(8192);
+    const { bytesRead } = await fd.read(headBuf, 0, headBuf.length, 0);
+    const head = headBuf.toString("utf8", 0, bytesRead);
+    for (const line of head.split("\n")) {
+      if (!line.trim()) continue;
+      const o = safeParse(line);
+      if (o) {
+        meta.cwd ??= o.cwd;
+        meta.version ??= o.version;
+        meta.gitBranch ??= o.gitBranch;
+        meta.entrypoint ??= o.entrypoint;
+        if (o.message?.model) {
+          meta.lastModel ??= o.message.model;
         }
-        const o = safeParse(line);
-        if (o) {
-          meta.cwd ??= o.cwd;
-          meta.version ??= o.version;
-          meta.gitBranch ??= o.gitBranch;
-          meta.entrypoint ??= o.entrypoint;
-          if (o.message?.model) {
-            meta.lastModel ??= o.message.model;
-          }
-          break;
-        }
+        break;
       }
-    } finally {
-      fs.closeSync(fd);
     }
   } catch {
     // ignore
+  } finally {
+    await fd?.close();
   }
   return meta;
+}
+
+/**
+ * Incremental read state — tracks how far we've read into a transcript file.
+ * On each call, only the bytes appended since lastOffset are read and parsed,
+ * then appended to the existing entries array. This avoids re-reading the
+ * entire 2MB tail on every tick.
+ */
+export interface IncrementalReadState {
+  /** Byte offset we've read up to (file position for next read). */
+  lastOffset: number;
+  /** File size at last read — used to detect truncation (file replaced). */
+  lastSize: number;
+  /** Parsed entries accumulated so far (only the trailing maxEntries are kept). */
+  entries: TranscriptEntry[];
+}
+
+/**
+ * Incrementally read NEW bytes from a transcript file and append parsed entries.
+ * If the file was truncated (size < lastOffset), re-reads from the tail.
+ * Keeps at most `maxEntries` entries in the returned state (oldest dropped).
+ *
+ * @param p           Path to the JSONL transcript file.
+ * @param prevState   Previous incremental state (or undefined for first read).
+ * @param maxEntries  Max entries to keep in memory (sliding window from the tail).
+ * @param maxBytes    On first read (no prevState), only read the trailing maxBytes.
+ *                    Subsequent reads are always incremental (only new bytes).
+ */
+export async function readEntriesIncremental(
+  p: string,
+  prevState: IncrementalReadState | undefined,
+  maxEntries = 500,
+  maxBytes = 2_000_000,
+): Promise<IncrementalReadState> {
+  let stat: fs.Stats;
+  try {
+    stat = await fs.promises.stat(p);
+  } catch {
+    return prevState ?? { lastOffset: 0, lastSize: 0, entries: [] };
+  }
+
+  const fileSize = stat.size;
+
+  // First read — no previous state: read the tail.
+  if (!prevState) {
+    const entries = await readTailEntries(p, maxBytes);
+    return {
+      lastOffset: fileSize,
+      lastSize: fileSize,
+      entries: trimToMax(entries, maxEntries),
+    };
+  }
+
+  // File truncated or replaced (size < lastOffset) — re-read from tail.
+  if (fileSize < prevState.lastOffset) {
+    const entries = await readTailEntries(p, maxBytes);
+    return {
+      lastOffset: fileSize,
+      lastSize: fileSize,
+      entries: trimToMax(entries, maxEntries),
+    };
+  }
+
+  // No new data — return previous state as-is.
+  if (fileSize === prevState.lastOffset) {
+    return prevState;
+  }
+
+  // Incremental read: only the new bytes appended since lastOffset.
+  const newBytes = fileSize - prevState.lastOffset;
+  let fd: fs.promises.FileHandle | undefined;
+  try {
+    fd = await fs.promises.open(p, "r");
+    const buf = Buffer.alloc(newBytes);
+    const { bytesRead } = await fd.read(buf, 0, newBytes, prevState.lastOffset);
+    const text = buf.toString("utf8", 0, bytesRead);
+    const newEntries = parseLines(text, true); // skipFirst=true: first line may be partial
+    const allEntries = [...prevState.entries, ...newEntries];
+    return {
+      lastOffset: fileSize,
+      lastSize: fileSize,
+      entries: trimToMax(allEntries, maxEntries),
+    };
+  } catch {
+    return prevState;
+  } finally {
+    await fd?.close();
+  }
+}
+
+/**
+ * Read the tail of a transcript file and return parsed entries.
+ * Used for initial reads and after truncation.
+ */
+async function readTailEntries(p: string, maxBytes: number): Promise<TranscriptEntry[]> {
+  let stat: fs.Stats;
+  try {
+    stat = await fs.promises.stat(p);
+  } catch {
+    return [];
+  }
+  let fd: fs.promises.FileHandle | undefined;
+  try {
+    fd = await fs.promises.open(p, "r");
+    let buf: Buffer;
+    let skipFirst = false;
+    if (stat.size > maxBytes) {
+      buf = Buffer.alloc(maxBytes);
+      await fd.read(buf, 0, maxBytes, stat.size - maxBytes);
+      skipFirst = true;
+    } else {
+      buf = Buffer.alloc(stat.size);
+      await fd.read(buf, 0, stat.size, 0);
+    }
+    const text = buf.toString("utf8");
+    return parseLines(text, skipFirst);
+  } catch {
+    return [];
+  } finally {
+    await fd?.close();
+  }
+}
+
+/**
+ * Parse newline-delimited JSON lines from a text chunk.
+ * If skipFirst is true, the first line is assumed to be partial and skipped.
+ */
+function parseLines(text: string, skipFirst: boolean): TranscriptEntry[] {
+  const lines = text.split("\n");
+  const start = skipFirst ? 1 : 0;
+  const out: TranscriptEntry[] = [];
+  for (let i = start; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line) continue;
+    const o = safeParse(line);
+    if (o) {
+      trimHeavyFields(o);
+      out.push(o);
+    }
+  }
+  return out;
+}
+
+/** Keep only the last N entries (sliding window from the tail). */
+function trimToMax(entries: TranscriptEntry[], max: number): TranscriptEntry[] {
+  return entries.length > max ? entries.slice(entries.length - max) : entries;
+}
+
+/**
+ * Strip memory-heavy fields we don't need for monitoring. Assistant entries
+ * carry the full message.content (tool results, large text blocks) which can
+ * be hundreds of KB per entry. We keep only usage + stop_reason + model.
+ */
+function trimHeavyFields(e: TranscriptEntry): void {
+  if (e.type !== "assistant" || !e.message) return;
+  const msg = e.message as { content?: unknown; usage?: unknown; model?: string; stop_reason?: string; role?: string };
+  msg.content = undefined;
 }
 
 export function safeParse(line: string): TranscriptEntry | null {
@@ -108,76 +264,47 @@ export function safeParse(line: string): TranscriptEntry | null {
   }
 }
 
-/**
- * Read a transcript file and return parsed entries. To bound memory on very
- * large sessions, only the trailing `maxBytes` of the file are read.
- */
-export function readEntries(p: string, maxBytes = 2_000_000): TranscriptEntry[] {
-  let stat: fs.Stats;
+export async function fileMtimeMs(p: string): Promise<number | undefined> {
   try {
-    stat = fs.statSync(p);
-  } catch {
-    return [];
-  }
-  let buf: Buffer;
-  let skipFirst = false;
-  const fd = fs.openSync(p, "r");
-  try {
-    if (stat.size > maxBytes) {
-      buf = Buffer.alloc(maxBytes);
-      fs.readSync(fd, buf, 0, maxBytes, stat.size - maxBytes);
-      skipFirst = true; // first line likely partial
-    } else {
-      buf = Buffer.alloc(stat.size);
-      fs.readSync(fd, buf, 0, stat.size, 0);
-    }
-  } finally {
-    fs.closeSync(fd);
-  }
-  const text = buf.toString("utf8");
-  const lines = text.split("\n");
-  const start = skipFirst ? 1 : 0;
-  const out: TranscriptEntry[] = [];
-  for (let i = start; i < lines.length; i++) {
-    const line = lines[i];
-    if (!line) {
-      continue;
-    }
-    const o = safeParse(line);
-    if (o) {
-      out.push(o);
-    }
-  }
-  return out;
-}
-
-export function fileMtimeMs(p: string): number | undefined {
-  try {
-    return fs.statSync(p).mtimeMs;
+    const stat = await fs.promises.stat(p);
+    return stat.mtimeMs;
   } catch {
     return undefined;
   }
 }
 
-/** Read the ENTIRE transcript file (no tail cap). Used for historical stats. */
-export function readAllEntries(p: string): TranscriptEntry[] {
-  let text: string;
+/**
+ * Read the ENTIRE transcript file (no tail cap). Used for historical stats.
+ * @param maxBytes  Safety cap — files larger than this are read from the tail
+ *                  only, to bound memory. Defaults to 20 MB.
+ */
+export async function readAllEntries(p: string, maxBytes = 20_000_000): Promise<TranscriptEntry[]> {
+  let stat: fs.Stats;
   try {
-    text = fs.readFileSync(p, "utf8");
+    stat = await fs.promises.stat(p);
   } catch {
     return [];
   }
-  const out: TranscriptEntry[] = [];
-  for (const line of text.split("\n")) {
-    if (!line) {
-      continue;
+  let fd: fs.promises.FileHandle | undefined;
+  try {
+    fd = await fs.promises.open(p, "r");
+    let buf: Buffer;
+    let skipFirst = false;
+    if (stat.size > maxBytes) {
+      buf = Buffer.alloc(maxBytes);
+      await fd.read(buf, 0, maxBytes, stat.size - maxBytes);
+      skipFirst = true;
+    } else {
+      buf = Buffer.alloc(stat.size);
+      await fd.read(buf, 0, stat.size, 0);
     }
-    const o = safeParse(line);
-    if (o) {
-      out.push(o);
-    }
+    const text = buf.toString("utf8");
+    return parseLines(text, skipFirst);
+  } catch {
+    return [];
+  } finally {
+    await fd?.close();
   }
-  return out;
 }
 
 export interface StatRequest {
@@ -192,9 +319,7 @@ export interface StatRequest {
 }
 
 function tsToMs2(s: string | undefined): number | undefined {
-  if (!s) {
-    return undefined;
-  }
+  if (!s) return undefined;
   const t = Date.parse(s);
   return Number.isNaN(t) ? undefined : t;
 }
@@ -207,33 +332,32 @@ function num2(n: unknown): number {
  * record (with full timestamp), filtered to those ending at/after sinceMs.
  * Files are read most-recent-first and collection stops once `cap` is reached.
  */
-export function collectAllRequests(
+export async function collectAllRequests(
   projectsDir: string,
   sinceMs = 0,
   cap = 5000
-): StatRequest[] {
+): Promise<StatRequest[]> {
   const files: { path: string; mtime: number }[] = [];
-  let subs: string[];
+  let subs: fs.Dirent[];
   try {
-    subs = fs
-      .readdirSync(projectsDir, { withFileTypes: true })
-      .filter((d) => d.isDirectory())
-      .map((d) => d.name);
+    subs = (await fs.promises.readdir(projectsDir, { withFileTypes: true }))
+      .filter((d) => d.isDirectory());
   } catch {
     return [];
   }
   for (const sub of subs) {
-    const subDir = path.join(projectsDir, sub);
+    const subDir = path.join(projectsDir, sub.name);
     let names: string[];
     try {
-      names = fs.readdirSync(subDir).filter((f) => f.endsWith(".jsonl"));
+      names = (await fs.promises.readdir(subDir)).filter((f) => f.endsWith(".jsonl"));
     } catch {
       continue;
     }
     for (const f of names) {
       const p = path.join(subDir, f);
       try {
-        files.push({ path: p, mtime: fs.statSync(p).mtimeMs });
+        const st = await fs.promises.stat(p);
+        files.push({ path: p, mtime: st.mtimeMs });
       } catch {
         // ignore
       }
@@ -243,24 +367,15 @@ export function collectAllRequests(
 
   const out: StatRequest[] = [];
   for (const file of files) {
-    if (out.length >= cap) {
-      break;
-    }
-    // Skip files not modified anywhere near the time window.
-    if (sinceMs > 0 && file.mtime < sinceMs - 86_400_000) {
-      continue;
-    }
-    const entries = readAllEntries(file.path);
+    if (out.length >= cap) break;
+    if (sinceMs > 0 && file.mtime < sinceMs - 86_400_000) continue;
+    const entries = await readAllEntries(file.path);
     let pendingStart: number | undefined;
     for (const e of entries) {
       if (e.type === "user") {
-        if (e.isApiErrorMessage) {
-          continue;
-        }
+        if (e.isApiErrorMessage) continue;
         const ms = tsToMs2(e.timestamp);
-        if (ms !== undefined) {
-          pendingStart = ms;
-        }
+        if (ms !== undefined) pendingStart = ms;
         continue;
       }
       if (e.type === "assistant" && e.message && e.message.usage) {
@@ -296,25 +411,19 @@ export function collectAllRequests(
  * Collect requests from a single transcript file (for the stats panel
  * scoped to the current session).
  */
-export function collectRequestsFromFile(
+export async function collectRequestsFromFile(
   transcriptPath: string | undefined,
   sinceMs = 0
-): StatRequest[] {
-  if (!transcriptPath) {
-    return [];
-  }
-  const entries = readAllEntries(transcriptPath);
+): Promise<StatRequest[]> {
+  if (!transcriptPath) return [];
+  const entries = await readAllEntries(transcriptPath);
   const out: StatRequest[] = [];
   let pendingStart: number | undefined;
   for (const e of entries) {
     if (e.type === "user") {
-      if (e.isApiErrorMessage) {
-        continue;
-      }
+      if (e.isApiErrorMessage) continue;
       const ms = tsToMs2(e.timestamp);
-      if (ms !== undefined) {
-        pendingStart = ms;
-      }
+      if (ms !== undefined) pendingStart = ms;
       continue;
     }
     if (e.type === "assistant" && e.message && e.message.usage) {
@@ -354,9 +463,7 @@ export function pickActiveSession(
   sessions: SessionInfo[],
   workspaceCwd?: string
 ): SessionInfo | undefined {
-  if (sessions.length === 0) {
-    return undefined;
-  }
+  if (sessions.length === 0) return undefined;
   if (workspaceCwd) {
     const norm = (s?: string) =>
       s ? path.resolve(s).toLowerCase().replace(/\\/g, "/") : "";
@@ -364,17 +471,12 @@ export function pickActiveSession(
     const match = sessions.find(
       (s) => s.cwd && norm(s.cwd) === target
     );
-    if (match) {
-      return match;
-    }
-    // Also accept sessions whose encoded dir name matches the encoded cwd.
+    if (match) return match;
     const encTarget = encodeCwd(workspaceCwd).toLowerCase();
     const encMatch = sessions.find((s) =>
       s.path.toLowerCase().includes(encTarget)
     );
-    if (encMatch) {
-      return encMatch;
-    }
+    if (encMatch) return encMatch;
   }
   return sessions[0]; // already sorted by mtime desc
 }
@@ -398,14 +500,14 @@ export interface ActiveSession {
  * process. Returns sessions whose owning process is still alive. This is the
  * authoritative source of "which sessions are currently open".
  */
-export function listActiveSessions(claudeDir?: string): ActiveSession[] {
+export async function listActiveSessions(claudeDir?: string): Promise<ActiveSession[]> {
   const dir = claudeDir && claudeDir.trim().length > 0
     ? claudeDir
     : path.join(os.homedir(), ".claude");
   const sessionsDir = path.join(dir, "sessions");
   let files: string[];
   try {
-    files = fs.readdirSync(sessionsDir).filter((f) => f.endsWith(".json"));
+    files = (await fs.promises.readdir(sessionsDir)).filter((f) => f.endsWith(".json"));
   } catch {
     return [];
   }
@@ -414,7 +516,8 @@ export function listActiveSessions(claudeDir?: string): ActiveSession[] {
     const p = path.join(sessionsDir, f);
     let obj: any;
     try {
-      obj = JSON.parse(fs.readFileSync(p, "utf8"));
+      const text = await fs.promises.readFile(p, "utf8");
+      obj = JSON.parse(text);
     } catch {
       continue;
     }
@@ -429,29 +532,29 @@ export function listActiveSessions(claudeDir?: string): ActiveSession[] {
         continue; // process dead — skip
       }
     }
+    const transcriptPath = await findTranscriptForSession(dir, obj.sessionId, obj.cwd);
     out.push({
       sessionId: obj.sessionId,
       pid: obj.pid,
       cwd: obj.cwd,
       startedAt: obj.startedAt,
-      transcriptPath: findTranscriptForSession(dir, obj.sessionId, obj.cwd),
+      transcriptPath,
     });
   }
   return out;
 }
 
 /** Locate the transcript JSONL for a sessionId under <claudeDir>/projects. */
-export function findTranscriptForSession(
+export async function findTranscriptForSession(
   claudeDir: string,
   sessionId: string,
   cwd?: string
-): string | undefined {
+): Promise<string | undefined> {
   const projectsDir = path.join(claudeDir, "projects");
-  let subdirs: string[];
+  let subdirs: fs.Dirent[];
   try {
-    subdirs = fs.readdirSync(projectsDir, { withFileTypes: true })
-      .filter((d) => d.isDirectory())
-      .map((d) => d.name);
+    subdirs = (await fs.promises.readdir(projectsDir, { withFileTypes: true }))
+      .filter((d) => d.isDirectory());
   } catch {
     return undefined;
   }
@@ -459,19 +562,19 @@ export function findTranscriptForSession(
   const ordered: string[] = [];
   if (cwd) {
     const enc = encodeCwd(cwd);
-    if (subdirs.includes(enc)) {
+    if (subdirs.some((d) => d.name === enc)) {
       ordered.push(enc);
     }
   }
   for (const s of subdirs) {
-    if (!ordered.includes(s)) {
-      ordered.push(s);
+    if (!ordered.includes(s.name)) {
+      ordered.push(s.name);
     }
   }
   for (const sub of ordered) {
     const candidate = path.join(projectsDir, sub, `${sessionId}.jsonl`);
     try {
-      fs.statSync(candidate);
+      await fs.promises.stat(candidate);
       return candidate;
     } catch {
       // not here

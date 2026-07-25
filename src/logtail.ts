@@ -3,6 +3,8 @@
 // Code sessions share one log file (one VS Code window = one exthost log), and
 // each session's signals are routed by sessionId where possible.
 //
+// All I/O is async to avoid blocking the VS Code extension host thread.
+//
 // Routing rules (verified against a real dual-session log):
 //   - update_session_state {sessionId, state, title}  -> routed EXACTLY by
 //     sessionId. Provides: running/idle, and the session TITLE (display name).
@@ -58,7 +60,7 @@ export interface LogSummary {
 
 export class LogTailer implements vscode.Disposable {
   private logPath: string | undefined;
-  private fd: number | undefined;
+  private fd: fs.promises.FileHandle | undefined;
   private offset = 0;
   private watcher: fs.FSWatcher | undefined;
   private sessions = new Map<string, PerSessionLogState>();
@@ -67,11 +69,13 @@ export class LogTailer implements vscode.Disposable {
   private rescanTimer: NodeJS.Timeout | undefined;
   private readonly pollingTimer: NodeJS.Timeout;
   private readonly codeLogsDir: string;
+  /** Guard against concurrent checkFile runs. */
+  private checking = false;
 
   constructor(codeLogsDir: string) {
     this.codeLogsDir = codeLogsDir;
-    this.pollingTimer = setInterval(() => this.checkFile(), 1000);
-    this.rescanTimer = setInterval(() => this.findAndOpen(), 10_000);
+    this.pollingTimer = setInterval(() => void this.checkFile(), 1000);
+    this.rescanTimer = setInterval(() => void this.findAndOpen(), 10_000);
     void this.findAndOpen();
   }
 
@@ -113,43 +117,38 @@ export class LogTailer implements vscode.Disposable {
     return s;
   }
 
-  private findAndOpen(): void {
-    const found = findLatestLog(this.codeLogsDir);
-    if (!found) {
-      return;
-    }
-    if (found === this.logPath) {
-      return;
-    }
-    this.close();
+  private async findAndOpen(): Promise<void> {
+    const found = await findLatestLog(this.codeLogsDir);
+    if (!found) return;
+    if (found === this.logPath) return;
+    await this.close();
     this.logPath = found;
     try {
-      this.fd = fs.openSync(found, "r");
-      this.offset = fs.statSync(found).size;
-      this.watcher = fs.watch(found, () => this.checkFile());
-      this.replayTail(96_000);
+      this.fd = await fs.promises.open(found, "r");
+      const stat = await fs.promises.stat(found);
+      this.offset = stat.size;
+      this.watcher = fs.watch(found, () => void this.checkFile());
+      await this.replayTail(96_000);
       this.emit();
     } catch {
       this.fd = undefined;
     }
   }
 
-  private replayTail(bytes: number): void {
-    if (!this.fd || !this.logPath) {
-      return;
-    }
+  private async replayTail(bytes: number): Promise<void> {
+    if (!this.fd || !this.logPath) return;
     try {
-      const size = fs.statSync(this.logPath).size;
-      const start = Math.max(0, size - bytes);
-      const buf = Buffer.alloc(size - start);
-      fs.readSync(this.fd, buf, 0, buf.length, start);
+      const stat = await fs.promises.stat(this.logPath);
+      const start = Math.max(0, stat.size - bytes);
+      const buf = Buffer.alloc(stat.size - start);
+      await this.fd.read(buf, 0, buf.length, start);
       this.parse(skipPartialFirstLine(buf.toString("utf8")));
     } catch {
       // ignore
     }
   }
 
-  private close(): void {
+  private async close(): Promise<void> {
     try {
       this.watcher?.close();
     } catch {
@@ -157,9 +156,7 @@ export class LogTailer implements vscode.Disposable {
     }
     this.watcher = undefined;
     try {
-      if (this.fd !== undefined) {
-        fs.closeSync(this.fd);
-      }
+      await this.fd?.close();
     } catch {
       // ignore
     }
@@ -167,32 +164,38 @@ export class LogTailer implements vscode.Disposable {
     this.offset = 0;
   }
 
-  private checkFile(): void {
-    if (!this.fd || !this.logPath) {
-      this.findAndOpen();
-      return;
-    }
-    let size: number;
+  private async checkFile(): Promise<void> {
+    // Guard against concurrent runs (polling timer + fs.watch can overlap).
+    if (this.checking) return;
+    this.checking = true;
     try {
-      size = fs.statSync(this.logPath).size;
-    } catch {
-      return;
-    }
-    if (size < this.offset) {
-      this.offset = 0;
-    }
-    if (size === this.offset) {
-      return;
-    }
-    try {
-      const len = size - this.offset;
-      const buf = Buffer.alloc(len);
-      fs.readSync(this.fd, buf, 0, len, this.offset);
-      this.offset = size;
-      this.parse(buf.toString("utf8"));
-      this.emit();
-    } catch {
-      // ignore
+      if (!this.fd || !this.logPath) {
+        await this.findAndOpen();
+        return;
+      }
+      let size: number;
+      try {
+        const stat = await fs.promises.stat(this.logPath);
+        size = stat.size;
+      } catch {
+        return;
+      }
+      if (size < this.offset) {
+        this.offset = 0;
+      }
+      if (size === this.offset) return;
+      try {
+        const len = size - this.offset;
+        const buf = Buffer.alloc(len);
+        await this.fd.read(buf, 0, len, this.offset);
+        this.offset = size;
+        this.parse(buf.toString("utf8"));
+        this.emit();
+      } catch {
+        // ignore
+      }
+    } finally {
+      this.checking = false;
     }
   }
 
@@ -201,9 +204,7 @@ export class LogTailer implements vscode.Disposable {
     const now = Date.now();
     for (const raw of lines) {
       const line = raw.trimEnd();
-      if (!line) {
-        continue;
-      }
+      if (!line) continue;
       this.parseLine(line, now);
     }
   }
@@ -228,9 +229,6 @@ export class LogTailer implements vscode.Disposable {
               this.lastRunningSessionId = req.sessionId;
             } else if (req.state === "waiting_input" || req.state === "idle") {
               s.running = false;
-              // Do NOT clear interrupted here — an interrupt is always
-              // followed by waiting_input, but the user wants the interrupt
-              // flag to persist until the next request starts.
             }
           }
         } catch {
@@ -240,19 +238,13 @@ export class LogTailer implements vscode.Disposable {
       return;
     }
 
-    // 2) rename_tab — also carries a title (but no sessionId). Try to apply to
-    //    the most recent running/active session if it has no title yet. This is
-    //    best-effort; update_session_state is the authoritative title source.
+    // 2) rename_tab — update_session_state is the authoritative title source.
     if (line.includes("rename_tab")) {
-      return; // update_session_state already gives us titled sessions reliably
+      return;
     }
 
     // 3) interrupt_claude — only mark interrupted if the running session is
-    //    actually mid-request (has a requestSentAtMs). Tab switches fire
-    //    interrupt_claude with a mismatched channelId, but those happen when
-    //    no real API request is in flight, so requestSentAtMs is stale/absent.
-    //    A genuine user interrupt (pressing Esc) always happens while a
-    //    request is active.
+    //    actually mid-request (has a requestSentAtMs).
     if (line.includes('"interrupt_claude"')) {
       const sid = this.lastRunningSessionId;
       if (sid) {
@@ -268,16 +260,14 @@ export class LogTailer implements vscode.Disposable {
 
     // 4) Request-level signals (no sessionId): attribute to running session.
     const sid = this.lastRunningSessionId;
-    if (!sid) {
-      return;
-    }
+    if (!sid) return;
     const s = this.getOrCreate(sid);
 
     if (line.includes("[API REQUEST]") && line.includes("/messages")) {
       s.requestSentAtMs = ts;
       s.firstByteAtMs = undefined;
       s.firstByteLatencyMs = undefined;
-      s.interrupted = false; // new request started → clear interrupt
+      s.interrupted = false;
       s.lastActivityMs = ts;
       return;
     }
@@ -367,7 +357,7 @@ export class LogTailer implements vscode.Disposable {
     if (this.rescanTimer) {
       clearInterval(this.rescanTimer);
     }
-    this.close();
+    void this.close();
   }
 }
 
@@ -380,16 +370,12 @@ function extractTime(line: string, fallback: number): number {
   const iso = /(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z)/.exec(line);
   if (iso) {
     const t = Date.parse(iso[1]);
-    if (!Number.isNaN(t)) {
-      return t;
-    }
+    if (!Number.isNaN(t)) return t;
   }
   const prefix = /^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)/.exec(line);
   if (prefix) {
     const t = Date.parse(prefix[1].replace(" ", "T") + "Z");
-    if (!Number.isNaN(t)) {
-      return t;
-    }
+    if (!Number.isNaN(t)) return t;
   }
   return fallback;
 }
@@ -405,30 +391,22 @@ export interface TtftRecord {
  * window. Each "first byte after Xms" line is timestamped; the model is taken
  * from the most recent "[API:timing] dispatching to firstParty model=..." line.
  * Returns records at/after sinceMs, sorted ascending.
- *
- * Unlike the old version which only scanned a single logPath, this walks every
- * log file under codeLogsDir whose mtime falls within range.
  */
-export function collectTtftRecords(codeLogsDir: string, sinceMs = 0): TtftRecord[] {
-  const logFiles = findAllLogFiles(codeLogsDir);
+export async function collectTtftRecords(codeLogsDir: string, sinceMs = 0): Promise<TtftRecord[]> {
+  const logFiles = await findAllLogFiles(codeLogsDir);
   const out: TtftRecord[] = [];
 
   for (const logPath of logFiles) {
-    // Quick check: if the file wasn't modified anywhere near the time window,
-    // skip it entirely. We use mtime as an upper bound — a file last modified
-    // before sinceMs cannot contain records after sinceMs.
     try {
-      const stat = fs.statSync(logPath);
-      if (sinceMs > 0 && stat.mtimeMs < sinceMs - 86_400_000) {
-        continue;
-      }
+      const stat = await fs.promises.stat(logPath);
+      if (sinceMs > 0 && stat.mtimeMs < sinceMs - 86_400_000) continue;
     } catch {
       continue;
     }
 
     let text: string;
     try {
-      text = fs.readFileSync(logPath, "utf8");
+      text = await fs.promises.readFile(logPath, "utf8");
     } catch {
       continue;
     }
@@ -452,31 +430,27 @@ export function collectTtftRecords(codeLogsDir: string, sinceMs = 0): TtftRecord
   return out;
 }
 
-export function findAllLogFiles(codeLogsDir: string): string[] {
-  let sessions: string[];
+export async function findAllLogFiles(codeLogsDir: string): Promise<string[]> {
+  let sessions: fs.Dirent[];
   try {
-    sessions = fs
-      .readdirSync(codeLogsDir, { withFileTypes: true })
-      .filter((d) => d.isDirectory())
-      .map((d) => d.name);
+    sessions = (await fs.promises.readdir(codeLogsDir, { withFileTypes: true }))
+      .filter((d) => d.isDirectory());
   } catch {
     return [];
   }
   const out: string[] = [];
   for (const s of sessions) {
-    let windows: string[];
+    let windows: fs.Dirent[];
     try {
-      windows = fs
-        .readdirSync(path.join(codeLogsDir, s), { withFileTypes: true })
-        .filter((d) => d.isDirectory() && d.name.startsWith("window"))
-        .map((d) => path.join(codeLogsDir, s, d.name));
+      windows = (await fs.promises.readdir(path.join(codeLogsDir, s.name), { withFileTypes: true }))
+        .filter((d) => d.isDirectory() && d.name.startsWith("window"));
     } catch {
       windows = [];
     }
     for (const w of windows) {
-      const candidate = path.join(w, "exthost", "Anthropic.claude-code", "Claude VScode.log");
+      const candidate = path.join(codeLogsDir, s.name, w.name, "exthost", "Anthropic.claude-code", "Claude VScode.log");
       try {
-        fs.statSync(candidate);
+        await fs.promises.stat(candidate);
         out.push(candidate);
       } catch {
         // not present in this window
@@ -486,31 +460,27 @@ export function findAllLogFiles(codeLogsDir: string): string[] {
   return out;
 }
 
-export function findLatestLog(codeLogsDir: string): string | undefined {
-  let sessions: string[];
+export async function findLatestLog(codeLogsDir: string): Promise<string | undefined> {
+  let sessions: fs.Dirent[];
   try {
-    sessions = fs
-      .readdirSync(codeLogsDir, { withFileTypes: true })
-      .filter((d) => d.isDirectory())
-      .map((d) => d.name);
+    sessions = (await fs.promises.readdir(codeLogsDir, { withFileTypes: true }))
+      .filter((d) => d.isDirectory());
   } catch {
     return undefined;
   }
   let best: { path: string; mtime: number } | undefined;
   for (const s of sessions) {
-    let windows: string[];
+    let windows: fs.Dirent[];
     try {
-      windows = fs
-        .readdirSync(path.join(codeLogsDir, s), { withFileTypes: true })
-        .filter((d) => d.isDirectory() && d.name.startsWith("window"))
-        .map((d) => path.join(codeLogsDir, s, d.name));
+      windows = (await fs.promises.readdir(path.join(codeLogsDir, s.name), { withFileTypes: true }))
+        .filter((d) => d.isDirectory() && d.name.startsWith("window"));
     } catch {
       windows = [];
     }
     for (const w of windows) {
-      const candidate = path.join(w, "exthost", "Anthropic.claude-code", "Claude VScode.log");
+      const candidate = path.join(codeLogsDir, s.name, w.name, "exthost", "Anthropic.claude-code", "Claude VScode.log");
       try {
-        const st = fs.statSync(candidate);
+        const st = await fs.promises.stat(candidate);
         if (!best || st.mtimeMs > best.mtime) {
           best = { path: candidate, mtime: st.mtimeMs };
         }
