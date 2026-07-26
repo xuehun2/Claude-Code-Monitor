@@ -10,13 +10,10 @@ import {
 } from "./metrics";
 import {
   listSessions,
-  pickActiveSession,
   readEntriesIncremental,
   resolveProjectsDir,
   fileMtimeMs,
   listActiveSessions,
-  findTranscriptForSession,
-  collectAllRequests,
   collectRequestsFromFile,
   clearSessionFileCache,
   type SessionInfo,
@@ -87,9 +84,9 @@ interface SessionView {
   sessionId: string;
   active: ActiveSession;
   statusItem: vscode.StatusBarItem;
-  /** Incremental read state — tracks file offset and accumulated entries. */
+  /** Incremental read state - tracks file offset and accumulated entries. */
   readState: IncrementalReadState | undefined;
-  /** Incremental compute accumulator — avoids re-traversing all entries. */
+  /** Incremental compute accumulator - avoids re-traversing all entries. */
   computeAcc: ComputeAccumulator | undefined;
   state: MonitorState | undefined;
   lastText: string;
@@ -115,12 +112,13 @@ class MonitorService implements vscode.Disposable {
   /** Guard against concurrent tick() runs (async I/O can overlap). */
   private ticking = false;
 
-  /** Cache for listActiveSessions — avoid scanning disk every tick. */
+  /** Cache for listActiveSessions - avoid scanning disk every tick. */
   private cachedActiveSessions: ActiveSession[] = [];
+  private cachedActiveIds: Set<string> = new Set();
   private cachedActiveSessionsAt = 0;
   private readonly activeSessionsTtlMs = 5000;
 
-  /** Cache for stats data — avoid re-reading transcript on every filter change. */
+  /** Cache for stats data - avoid re-reading transcript on every filter change. */
   private statsCache: {
     transcriptPath: string;
     mtime: number;
@@ -128,14 +126,14 @@ class MonitorService implements vscode.Disposable {
     createdAt: number;
   } | undefined;
 
-  /** Cache for getModels — avoid re-reading transcript. */
+  /** Cache for getModels - avoid re-reading transcript. */
   private modelsCache: {
     transcriptPath: string;
     mtime: number;
     models: string[];
   } | undefined;
 
-  /** Max age for stats/models cache — after this, re-read to pick up new data. */
+  /** Max age for stats/models cache - after this, re-read to pick up new data. */
   private readonly statsCacheTtlMs = 30_000;
 
   constructor(dashboard: Dashboard) {
@@ -197,7 +195,7 @@ class MonitorService implements vscode.Disposable {
 
   /**
    * Schedule a tick with debounce. Coalesces rapid fire from logTailer events
-   * and the polling timer into a single tick — prevents re-reading files many
+   * and the polling timer into a single tick - prevents re-reading files many
    * times per second during streaming output.
    */
   private scheduleTick(): void {
@@ -361,20 +359,39 @@ class MonitorService implements vscode.Disposable {
 
     points.sort((a, b) => a.ts - b.ts);
     const totalCount = points.length;
-    const vals = points.map((p) => p.value);
+    // Single-pass summary (avoids Math.min/max(...vals) spread, which can blow
+    // the call stack or stall on very large datasets).
+    let min = Infinity;
+    let max = -Infinity;
+    let sum = 0;
+    for (const p of points) {
+      const v = p.value;
+      if (v < min) min = v;
+      if (v > max) max = v;
+      sum += v;
+    }
     const summary = {
       count: totalCount,
-      avg: vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : 0,
-      min: vals.length ? Math.min(...vals) : 0,
-      max: vals.length ? Math.max(...vals) : 0,
-      total: vals.reduce((a, b) => a + b, 0),
+      avg: totalCount ? sum / totalCount : 0,
+      min: totalCount ? min : 0,
+      max: totalCount ? max : 0,
+      total: sum,
     };
+
+    // Downsample for chart rendering: a multi-thousand-point session would
+    // otherwise create thousands of DOM bars + a huge postMessage payload.
+    // The summary above is computed from the full set, so stats stay accurate;
+    // only the chart is decimated (stride sampling).
+    if (points.length > 1500) {
+      const stride = Math.ceil(points.length / 1500);
+      points = points.filter((_, i) => i % stride === 0);
+    }
 
     return { points, summary, unit, metric, model };
   }
 
   private async tick(): Promise<void> {
-    // Guard against concurrent ticks — if a previous tick is still awaiting I/O,
+    // Guard against concurrent ticks - if a previous tick is still awaiting I/O,
     // skip this one. The next polling timer will try again.
     if (this.ticking) {
       return;
@@ -399,17 +416,19 @@ class MonitorService implements vscode.Disposable {
     const ttl = this.cachedActiveSessions.length > 0 ? this.activeSessionsTtlMs : emptyCacheTtl;
     const useCache = now - this.cachedActiveSessionsAt < ttl;
     let active: ActiveSession[];
+    let activeIds: Set<string>;
     if (useCache) {
       active = this.cachedActiveSessions;
+      activeIds = this.cachedActiveIds;
     } else {
       active = await listActiveSessions(this.claudeDir);
-      // Only update cache + timestamp when we actually scanned — otherwise
+      // Only update cache + timestamp when we actually scanned - otherwise
       // a cached empty result would refresh its own TTL and never expire.
       this.cachedActiveSessions = active;
       this.cachedActiveSessionsAt = now;
+      activeIds = new Set(active.map((a) => a.sessionId));
+      this.cachedActiveIds = activeIds;
     }
-
-    const activeIds = new Set(active.map((a) => a.sessionId));
 
     // Remove views for sessions no longer active.
     for (const [sid, v] of this.views) {
@@ -446,7 +465,9 @@ class MonitorService implements vscode.Disposable {
           lastBgKey: "",
         };
         this.views.set(a.sessionId, v);
-        this.disposables.push(statusItem);
+        // Note: statusItem is NOT pushed to disposables - it is tracked via
+        // this.views and disposed when the view is removed or in dispose().
+        // Pushing it here would double-dispose and grow disposables unbounded.
       } else {
         v.active = a;
       }
@@ -597,12 +618,12 @@ function statusText(s: MonitorState): string {
         : s.phase === "sending" || s.phase === "streaming"
           ? "$(loading~spin)"
           : "$(comment-discussion)";
-  const model = s.model ? shortModel(s.model) : "—";
+  const model = s.model ? shortModel(s.model) : "-";
   const ctx = fmtTokens(s.contextTokens);
   const pct = `${(s.contextPct * 100).toFixed(0)}%`;
   const title = shortTitle(s.title);
 
-  let rateSlot = "—";
+  let rateSlot = "-";
   if (s.lastRequest) {
     const out = fmtTokens(s.lastRequest.outputTokens);
     const rate = fmtRate(s.lastRequest.outputRate);
@@ -643,7 +664,7 @@ function statusTooltip(s: MonitorState): string {
   const lines: string[] = [];
   lines.push(`**Claude Code Monitor**`);
   lines.push("");
-  lines.push(`- **Session:** ${s.title ?? s.sessionId ?? "—"}${s.sessionId ? ` (${s.sessionId.slice(0, 8)})` : ""}`);
+  lines.push(`- **Session:** ${s.title ?? s.sessionId ?? "-"}${s.sessionId ? ` (${s.sessionId.slice(0, 8)})` : ""}`);
   const phaseLabel: Record<MonitorState["phase"], string> = {
     idle: "○ idle",
     sending: "● sending (waiting first byte)",
@@ -653,7 +674,7 @@ function statusTooltip(s: MonitorState): string {
   };
   lines.push(`- **Status:** ${phaseLabel[s.phase]}`);
   if (!s.logAvailable) {
-    lines.push(`  - _live log unavailable — phase is inferred from transcript_`);
+    lines.push(`  - _live log unavailable - phase is inferred from transcript_`);
   }
   if (s.phase === "retrying") {
     const parts: string[] = [];
@@ -676,13 +697,13 @@ function statusTooltip(s: MonitorState): string {
   if (s.firstByteLatencyMs !== undefined) {
     lines.push(`  - first byte: ${fmtMs(s.firstByteLatencyMs)}`);
   }
-  lines.push(`- **Model:** ${s.model ?? "—"}${s.serviceTier ? ` (${s.serviceTier}` : ""}${s.speed ? `, ${s.speed}` : ""}${s.serviceTier ? ")" : ""}`);
+  lines.push(`- **Model:** ${s.model ?? "-"}${s.serviceTier ? ` (${s.serviceTier}` : ""}${s.speed ? `, ${s.speed}` : ""}${s.serviceTier ? ")" : ""}`);
   lines.push(`- **Context:** ${fmtTokens(s.contextTokens)} / ${fmtTokens(s.contextLimit)} (${(s.contextPct * 100).toFixed(1)}%)`);
   if (s.contextPct > 0.85) {
     lines.push(`  - ⚠ **Context high!** Run \`/compact\` to free space.`);
   }
   if (s.lastRequest) {
-    lines.push(`- **Last request:** ${fmtMs(s.lastRequest.durationMs)} · ${fmtRate(s.lastRequest.outputRate)} · ${fmtTokens(s.lastRequest.outputTokens)} out · stop=${s.lastRequest.stopReason ?? "—"}`);
+    lines.push(`- **Last request:** ${fmtMs(s.lastRequest.durationMs)} · ${fmtRate(s.lastRequest.outputRate)} · ${fmtTokens(s.lastRequest.outputTokens)} out · stop=${s.lastRequest.stopReason ?? "-"}`);
   }
   lines.push(`- **Session:** ${s.requestCount} requests · ${fmtTokens(s.totalOutputTokens)} out · ${fmtTokens(s.totalInputTokens)} ctx`);
   if (s.cwd) {

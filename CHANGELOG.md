@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.5.5 (2026-07-27)
+
+### 🐛 隐藏 bug 修复 + 🚀 进一步性能优化
+
+全面排查后修复的隐藏问题与优化点:
+
+- **修复 `findAndOpen` 竞态** - 10s 重扫定时器与 `checkFile` 可能并发调用 `findAndOpen`,无并发保护会导致 `fd`/`watcher` 泄漏。新增 `opening` 守卫
+- **修复状态栏双重 dispose** - `StatusBarItem` 既被 push 到 `disposables` 又在 view 移除时单独 dispose,导致 `disposables` 数组随会话开关无限增长且重复 dispose。改为仅由 views 跟踪
+- **修复 `Math.min/max(...vals)` 展开** - 统计面板大数据集下展开运算符可能爆调用栈或卡顿。改为单次循环求 min/max/sum
+- **复用 `activeIds` Set** - 每个 tick 都 `new Set(active.map(...))` 重建会话 id 集合,即使会话列表已缓存。改为缓存复用
+- **dashboard 流式节流** - 非空闲时每秒 postMessage + DOM 重建。`stateSig` 的 liveElapsed 改为 2s 粒度,签名不变时跳过,流式期间 dashboard 降至最多每 2s 刷新一次(状态栏仍 1s),phase 切换立即刷新
+- **统计图表降采样** - 长会话数千个点会创建数千个 DOM bar + 巨大 postMessage。summary 仍基于全量数据,图表点超过 1500 时按步长降采样
+- **统计读取限制 10MB** - `collectRequestsFromFile` 之前同步解析最多 20MB transcript,dashboard 打开时会阻塞宿主线程。限制为 10MB
+- **清理未使用的导入** - 移除 `pickActiveSession`/`findTranscriptForSession`/`collectAllRequests` 等死导入
+
 ## 0.5.4 (2026-07-27)
 
 ### 🚀 流式卡顿深度优化（扩展宿主线程占用）

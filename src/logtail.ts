@@ -14,7 +14,7 @@
 //     update_session_state.running). A session is always running while it is
 //     mid-request or retrying, so this attribution is correct for the retry/
 //     first-byte case. The only ambiguity is two sessions running concurrently
-//     and interleaving requests — rare in practice.
+//     and interleaving requests - rare in practice.
 //   - interrupt_claude {channelId}  -> no sessionId; attributed to the current
 //     running session (you can only interrupt a running one).
 //
@@ -73,6 +73,8 @@ export class LogTailer implements vscode.Disposable {
   private checking = false;
   /** Debounce timer for fs.watch events - coalesces bursts into one check. */
   private watchDebounce: NodeJS.Timeout | undefined;
+  /** Guard against concurrent findAndOpen runs (rescan timer + checkFile). */
+  private opening = false;
 
   constructor(codeLogsDir: string) {
     this.codeLogsDir = codeLogsDir;
@@ -120,41 +122,50 @@ export class LogTailer implements vscode.Disposable {
   }
 
   private async findAndOpen(): Promise<void> {
-    // If we already have an active log file that's still being written, skip
-    // the directory rescan - findLatestLog stats every candidate log file
-    // across all sessions/windows, which is wasteful while the current log is
-    // fresh. Only rescan when the current log goes stale or disappears.
-    if (this.logPath && this.fd) {
-      try {
-        const st = await fs.promises.stat(this.logPath);
-        if (Date.now() - st.mtimeMs < 5 * 60 * 1000) return;
-      } catch {
-        // current log gone - fall through to rescan
-      }
-    }
-    const found = await findLatestLog(this.codeLogsDir);
-    if (!found) return;
-    if (found === this.logPath) return;
-    await this.close();
-    this.logPath = found;
+    // Guard against concurrent opens: the 10s rescan timer and checkFile can
+    // both call findAndOpen; without this, two concurrent opens could race on
+    // this.fd/this.watcher and leak a file handle or watcher.
+    if (this.opening) return;
+    this.opening = true;
     try {
-      this.fd = await fs.promises.open(found, "r");
-      const stat = await fs.promises.stat(found);
-      this.offset = stat.size;
-      // Debounce fs.watch: on Windows, a rapidly-written log file fires many
-      // events. Coalesce them into a single check 200ms after the last event
-      // so a streaming burst doesn't flood the shared extension-host event loop.
-      this.watcher = fs.watch(found, () => {
-        if (this.watchDebounce) clearTimeout(this.watchDebounce);
-        this.watchDebounce = setTimeout(() => {
-          this.watchDebounce = undefined;
-          void this.checkFile();
-        }, 200);
-      });
-      await this.replayTail(96_000);
-      this.emit();
-    } catch {
-      this.fd = undefined;
+      // If we already have an active log file that's still being written, skip
+      // the directory rescan - findLatestLog stats every candidate log file
+      // across all sessions/windows, which is wasteful while the current log is
+      // fresh. Only rescan when the current log goes stale or disappears.
+      if (this.logPath && this.fd) {
+        try {
+          const st = await fs.promises.stat(this.logPath);
+          if (Date.now() - st.mtimeMs < 5 * 60 * 1000) return;
+        } catch {
+          // current log gone - fall through to rescan
+        }
+      }
+      const found = await findLatestLog(this.codeLogsDir);
+      if (!found) return;
+      if (found === this.logPath) return;
+      await this.close();
+      this.logPath = found;
+      try {
+        this.fd = await fs.promises.open(found, "r");
+        const stat = await fs.promises.stat(found);
+        this.offset = stat.size;
+        // Debounce fs.watch: on Windows, a rapidly-written log file fires many
+        // events. Coalesce them into a single check 200ms after the last event
+        // so a streaming burst doesn't flood the shared extension-host event loop.
+        this.watcher = fs.watch(found, () => {
+          if (this.watchDebounce) clearTimeout(this.watchDebounce);
+          this.watchDebounce = setTimeout(() => {
+            this.watchDebounce = undefined;
+            void this.checkFile();
+          }, 200);
+        });
+        await this.replayTail(96_000);
+        this.emit();
+      } catch {
+        this.fd = undefined;
+      }
+    } finally {
+      this.opening = false;
     }
   }
 
@@ -254,7 +265,7 @@ export class LogTailer implements vscode.Disposable {
   private parseLine(line: string, now: number): void {
     const ts = extractTime(line, now);
 
-    // 1) update_session_state — routed exactly by sessionId.
+    // 1) update_session_state - routed exactly by sessionId.
     if (line.includes("update_session_state")) {
       const wv = /Received message from webview: (\{.*\})\s*$/.exec(line);
       if (wv) {
@@ -280,12 +291,12 @@ export class LogTailer implements vscode.Disposable {
       return;
     }
 
-    // 2) rename_tab — update_session_state is the authoritative title source.
+    // 2) rename_tab - update_session_state is the authoritative title source.
     if (line.includes("rename_tab")) {
       return;
     }
 
-    // 3) interrupt_claude — only mark interrupted if the running session is
+    // 3) interrupt_claude - only mark interrupted if the running session is
     //    actually mid-request (has a requestSentAtMs).
     if (line.includes('"interrupt_claude"')) {
       const sid = this.lastRunningSessionId;

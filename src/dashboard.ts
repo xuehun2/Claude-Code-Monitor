@@ -7,7 +7,7 @@ export class Dashboard {
   private panel: vscode.WebviewPanel | undefined;
   private readonly extUri: vscode.Uri;
   private lastState: MonitorState | undefined;
-  /** Signature of last state update — used to skip redundant postMessage. */
+  /** Signature of last state update - used to skip redundant postMessage. */
   private lastSig = "";
   /** SessionId the dashboard is currently pinned to (undefined = follow most recent). */
   currentSessionId: string | undefined;
@@ -61,12 +61,14 @@ export class Dashboard {
       return;
     }
 
-    // Skip redundant updates: if idle and the meaningful fields haven't
-    // changed since the last update, don't postMessage — avoids rebuilding
-    // the webview DOM every second when nothing is happening.
+    // Skip redundant updates: if the meaningful fields haven't changed since
+    // the last update, don't postMessage - avoids rebuilding the webview DOM
+    // every tick. During streaming the only fast-changing field is the live
+    // timer; stateSig quantizes it to 2s, so the dashboard refreshes at most
+    // every 2s while a turn is in flight (the status bar stays at 1s). Phase
+    // changes (idle<->streaming) are in the sig and flush immediately.
     const sig = stateSig(state);
-    const isIdle = state.phase === "idle";
-    if (isIdle && this.lastSig === sig && this.lastState) {
+    if (this.lastSig === sig && this.lastState) {
       this.lastState = state;
       return;
     }
@@ -91,7 +93,7 @@ export class Dashboard {
     this.panel?.webview.postMessage({ type: "refreshStats" });
   }
 
-  /** Clear cached stats data — called when the dashboard panel is closed. */
+  /** Clear cached stats data - called when the dashboard panel is closed. */
   onPanelClosed: (() => void) | undefined;
 
   private getHtml(): string {
@@ -172,7 +174,7 @@ export class Dashboard {
   .bars .bar { flex:none; width:27px; min-width:27px; background: var(--vscode-charts-blue, #3794ff); opacity:.85; border-radius:2px 2px 0 0; cursor:pointer; position:relative; }
   .bars .bar:hover { opacity:1; background: var(--vscode-charts-green, #89d185); }
   .bars .bar.capped { background: var(--vscode-charts-orange, #cca700); }
-  /* Rich tooltip — fixed position, positioned by JS */
+  /* Rich tooltip - fixed position, positioned by JS */
   .tooltip { display:none; position:fixed; background:var(--vscode-editorHoverWidget-background, #000); color:var(--vscode-editorHoverWidget-foreground, #fff); border:1px solid var(--vscode-editorWidget-border,#555); border-radius:6px; padding:6px 10px; font-size:11px; white-space:nowrap; z-index:9999; line-height:1.6; pointer-events:none; max-height:220px; overflow:hidden; }
   .xaxis { height:20px; position:relative; margin-top:2px; }
   .empty { margin: auto; opacity:.5; font-size:12px; }
@@ -181,7 +183,7 @@ export class Dashboard {
 <body>
   <div class="row">
     <h1>Claude Code · Live Monitor</h1>
-    <span id="updated">—</span>
+    <span id="updated">-</span>
   </div>
 
   <div class="row">
@@ -190,14 +192,14 @@ export class Dashboard {
   </div>
 
   <div class="grid">
-    <div class="card"><div class="label">Model</div><div class="value" id="model">—</div><div class="sub" id="tier"></div></div>
-    <div class="card"><div class="label">Context</div><div class="value" id="ctx">—</div>
+    <div class="card"><div class="label">Model</div><div class="value" id="model">-</div><div class="sub" id="tier"></div></div>
+    <div class="card"><div class="label">Context</div><div class="value" id="ctx">-</div>
       <div class="ctxbar" id="ctxbar"><div style="width:0%"></div></div>
       <div class="sub" id="ctxsub"></div></div>
-    <div class="card"><div class="label">Last request</div><div class="value" id="dur">—</div><div class="sub" id="durSub"></div></div>
-    <div class="card"><div class="label">Output rate</div><div class="value" id="rate">—</div><div class="sub" id="rateSub"></div></div>
-    <div class="card"><div class="label">Live</div><div class="value" id="inflight">—</div><div class="sub" id="retry"></div></div>
-    <div class="card"><div class="label">Session total</div><div class="value" id="total">—</div><div class="sub" id="totalSub"></div></div>
+    <div class="card"><div class="label">Last request</div><div class="value" id="dur">-</div><div class="sub" id="durSub"></div></div>
+    <div class="card"><div class="label">Output rate</div><div class="value" id="rate">-</div><div class="sub" id="rateSub"></div></div>
+    <div class="card"><div class="label">Live</div><div class="value" id="inflight">-</div><div class="sub" id="retry"></div></div>
+    <div class="card"><div class="label">Session total</div><div class="value" id="total">-</div><div class="sub" id="totalSub"></div></div>
   </div>
 
   <h1 style="margin-top:18px">统计 · Statistics</h1>
@@ -251,9 +253,9 @@ export class Dashboard {
   function esc(s){ return String(s==null?'':s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
 
   // --- value formatters (mirror metrics.ts) ---
-  function fmtTok(n){ if(!isFinite(n))return'—'; if(n>=1e6)return(n/1e6).toFixed(2)+'M'; if(n>=1e3)return(n/1e3).toFixed(1)+'k'; return String(Math.round(n)); }
-  function fmtMs(ms){ if(!isFinite(ms))return'—'; if(ms<1000)return Math.round(ms)+'ms'; const s=ms/1000; return s<60?s.toFixed(1)+'s':Math.floor(s/60)+'m'+Math.round(s%60)+'s'; }
-  function fmtRate(r){ if(!isFinite(r)||r<=0)return'—'; return r>=100?r.toFixed(0)+' t/s':r.toFixed(1)+' t/s'; }
+  function fmtTok(n){ if(!isFinite(n))return'-'; if(n>=1e6)return(n/1e6).toFixed(2)+'M'; if(n>=1e3)return(n/1e3).toFixed(1)+'k'; return String(Math.round(n)); }
+  function fmtMs(ms){ if(!isFinite(ms))return'-'; if(ms<1000)return Math.round(ms)+'ms'; const s=ms/1000; return s<60?s.toFixed(1)+'s':Math.floor(s/60)+'m'+Math.round(s%60)+'s'; }
+  function fmtRate(r){ if(!isFinite(r)||r<=0)return'-'; return r>=100?r.toFixed(0)+' t/s':r.toFixed(1)+' t/s'; }
   function fmtVal(v, unit){
     if(unit==='tok') return fmtTok(v);
     if(unit==='ms') return fmtMs(v);
@@ -441,7 +443,7 @@ export class Dashboard {
     const chartWidth = Math.max(neededWidth, availableWidth);
     plot.style.minWidth = chartWidth + 'px';
 
-    // bars — capped values get a special class and ▲ indicator
+    // bars - capped values get a special class and ▲ indicator
     points.forEach((p, idx) => {
       const b = document.createElement('div');
       const capped = p.value > yMax;
@@ -452,7 +454,7 @@ export class Dashboard {
       let lines = [];
       lines.push('<b>' + esc(fmtVal(p.value, unit)) + (capped ? ' ▲' : '') + '</b>');
       lines.push('时间: ' + esc(fmtTimeFull(p.ts)));
-      lines.push('模型: ' + esc(r.model || '—'));
+      lines.push('模型: ' + esc(r.model || '-'));
       lines.push('耗时: ' + esc(fmtMs(r.durationMs || 0)));
       lines.push('输出: ' + esc(fmtTok(r.outputTokens || 0)) + ' @ ' + esc(fmtRate(r.outputRate || 0)));
       lines.push('输入: ' + esc(fmtTok((r.inputTokens||0) + (r.cacheReadTokens||0))));
@@ -466,7 +468,7 @@ export class Dashboard {
     // X-axis: smart time labels at date changes, hour boundaries, etc.
     // Walk through all bars and place labels only at significant time transitions.
     // All labels must respect minimum pixel spacing. Date changes (priority 3)
-    // are the most important — if a date change is too close to the previous
+    // are the most important - if a date change is too close to the previous
     // label, it REPLACES the previous label (date info is more important).
     const minLabelPx = 56; // minimum pixels between label centers
     const minLabelEvery = Math.max(1, Math.ceil(minLabelPx / barSlot));
@@ -559,7 +561,7 @@ export class Dashboard {
       $('updated').textContent = s.updatedAtMs ? new Date(s.updatedAtMs).toLocaleTimeString() : '';
       const st = $('status'); st.className = 'status ' + s.statusKind; st.textContent = s.statusText;
       $('session').textContent = s.sessionLabel || '';
-      $('model').textContent = s.model || '—';
+      $('model').textContent = s.model || '-';
       $('tier').textContent = [s.serviceTier, s.speed].filter(Boolean).join(' · ') || '';
       $('ctx').textContent = s.contextText; setBar($('ctxbar'), s.contextPct); $('ctxsub').textContent = s.contextSub;
       $('dur').textContent = s.durText; $('durSub').textContent = s.durSub || '';
@@ -588,7 +590,7 @@ export class Dashboard {
 /**
  * Compute a lightweight signature of a MonitorState for change detection.
  * Only includes fields that would produce visible changes in the dashboard
- * when the monitor is idle — avoids the expensive history/requests array.
+ * when the monitor is idle - avoids the expensive history/requests array.
  */
 function stateSig(s: MonitorState): string {
   return [
@@ -604,7 +606,7 @@ function stateSig(s: MonitorState): string {
     s.retrying ? "1" : "0",
     s.retryAttempt ?? "",
     s.retryCode ?? "",
-    s.liveElapsedMs < 1000 ? 0 : Math.floor(s.liveElapsedMs / 1000), // 1s granularity
+    s.liveElapsedMs < 2000 ? 0 : Math.floor(s.liveElapsedMs / 2000), // 2s granularity (throttles streaming dashboard updates)
     s.title ?? "",
   ].join("|");
 }
@@ -669,8 +671,8 @@ function toPayload(s: MonitorState): DashboardPayload {
       statusText = s.lastRequest ? "○ idle" : "○ idle (no requests yet)";
   }
 
-  const dur = s.lastRequest ? fmtMs(s.lastRequest.durationMs) : "—";
-  const rate = s.lastRequest ? fmtRate(s.lastRequest.outputRate) : "—";
+  const dur = s.lastRequest ? fmtMs(s.lastRequest.durationMs) : "-";
+  const rate = s.lastRequest ? fmtRate(s.lastRequest.outputRate) : "-";
 
   const retryBits: string[] = [];
   if (s.phase === "retrying") {
@@ -712,7 +714,7 @@ function toPayload(s: MonitorState): DashboardPayload {
         ? fmtMs(s.liveElapsedMs)
         : s.phase === "interrupted"
           ? "interrupted"
-          : "—",
+          : "-",
     retryText: retryBits.join(" · "),
     totalText: `${s.requestCount} req`,
     totalSub: `${fmtTokens(s.totalOutputTokens)} out · ${fmtTokens(

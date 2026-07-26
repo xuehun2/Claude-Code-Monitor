@@ -466,7 +466,10 @@ export async function collectRequestsFromFile(
   sinceMs = 0
 ): Promise<StatRequest[]> {
   if (!transcriptPath) return [];
-  const entries = await readAllEntries(transcriptPath);
+  // Cap at 10MB: parsing a 20MB+ transcript synchronously can stall the
+  // extension host when the dashboard is open. Stats then cover the most
+  // recent ~10MB of the session, which is what the chart visualizes anyway.
+  const entries = await readAllEntries(transcriptPath, 10_000_000);
   const out: StatRequest[] = [];
   let pendingStart: number | undefined;
   for (const e of entries) {

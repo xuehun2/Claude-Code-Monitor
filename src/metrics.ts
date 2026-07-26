@@ -328,7 +328,7 @@ function processEntries(
 
 /**
  * Build a MonitorState from an accumulator and the full entries array.
- * This is the "finalize" step — it reads the accumulated values and
+ * This is the "finalize" step - it reads the accumulated values and
  * computes the derived fields (contextPct, inFlight, trimmed requests, etc.).
  */
 function buildState(acc: ComputeAccumulator, entries: TranscriptEntry[], opts: ComputeOptions): MonitorState {
@@ -417,7 +417,7 @@ export function computeStateIncremental(
   prevAcc: ComputeAccumulator | undefined,
   opts: ComputeOptions
 ): { state: MonitorState; acc: ComputeAccumulator } {
-  // No entries at all — return empty state.
+  // No entries at all - return empty state.
   if (entries.length === 0) {
     const acc = freshAccumulator();
     const state: MonitorState = {
@@ -484,7 +484,7 @@ export function computeStateIncremental(
 }
 
 /**
- * Full (non-incremental) computation — processes all entries from scratch.
+ * Full (non-incremental) computation - processes all entries from scratch.
  * Kept for backward compatibility and for cases where incremental state
  * is not available (e.g. collectRequestsFromFile).
  */
@@ -632,7 +632,7 @@ export function fmtMs(ms: number): string {
 
 export function fmtRate(tokPerSec: number): string {
   if (!Number.isFinite(tokPerSec) || tokPerSec <= 0) {
-    return "—";
+    return "-";
   }
   if (tokPerSec >= 100) {
     return `${tokPerSec.toFixed(0)} t/s`;
