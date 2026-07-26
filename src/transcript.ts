@@ -1,7 +1,7 @@
 // Discover and parse Claude Code transcript JSONL files.
 // All I/O is async to avoid blocking the VS Code extension host thread.
 // For real-time monitoring, readEntriesIncremental() supports incremental
-// reading — only new bytes appended since the last read are fetched and parsed.
+// reading - only new bytes appended since the last read are fetched and parsed.
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
@@ -100,7 +100,7 @@ async function quickMeta(p: string): Promise<Partial<SessionInfo>> {
 }
 
 /**
- * Incremental read state — tracks how far we've read into a transcript file.
+ * Incremental read state - tracks how far we've read into a transcript file.
  * On each call, only the bytes appended since lastOffset are read and parsed,
  * then appended to the existing entries array. This avoids re-reading the
  * entire 2MB tail on every tick.
@@ -108,7 +108,7 @@ async function quickMeta(p: string): Promise<Partial<SessionInfo>> {
 export interface IncrementalReadState {
   /** Byte offset we've read up to (file position for next read). */
   lastOffset: number;
-  /** File size at last read — used to detect truncation (file replaced). */
+  /** File size at last read - used to detect truncation (file replaced). */
   lastSize: number;
   /** Parsed entries accumulated so far (only the trailing maxEntries are kept). */
   entries: TranscriptEntry[];
@@ -146,7 +146,7 @@ export async function readEntriesIncremental(
 
   const fileSize = stat.size;
 
-  // First read — no previous state: read the tail.
+  // First read - no previous state: read the tail.
   if (!prevState) {
     const entries = await readTailEntries(p, maxBytes);
     return {
@@ -157,7 +157,7 @@ export async function readEntriesIncremental(
     };
   }
 
-  // File truncated or replaced (size < lastOffset) — re-read from tail.
+  // File truncated or replaced (size < lastOffset) - re-read from tail.
   if (fileSize < prevState.lastOffset) {
     const entries = await readTailEntries(p, maxBytes);
     return {
@@ -168,7 +168,7 @@ export async function readEntriesIncremental(
     };
   }
 
-  // No new data — return previous state as-is.
+  // No new data - return previous state as-is.
   if (fileSize === prevState.lastOffset) {
     return prevState;
   }
@@ -325,7 +325,7 @@ export async function fileMtimeMs(p: string): Promise<number | undefined> {
 
 /**
  * Read the ENTIRE transcript file (no tail cap). Used for historical stats.
- * @param maxBytes  Safety cap — files larger than this are read from the tail
+ * @param maxBytes  Safety cap - files larger than this are read from the tail
  *                  only, to bound memory. Defaults to 20 MB.
  */
 export async function readAllEntries(p: string, maxBytes = 20_000_000): Promise<TranscriptEntry[]> {
@@ -546,7 +546,29 @@ export interface ActiveSession {
 }
 
 /**
- * Read ~/.claude/sessions/<pid>.json — each file is one live Claude Code
+ * Cache of parsed session files, keyed by file path. Avoids re-reading and
+ * re-parsing the (potentially many) stale session files on every 5s scan.
+ * Each entry is re-validated by mtime (file overwritten -> re-read) and a
+ * `dead` flag (process gone -> skip until the file changes).
+ */
+interface CachedSessionFile {
+  mtime: number;
+  pid: number | undefined;
+  sessionId: string | undefined;
+  cwd?: string;
+  startedAt?: number;
+  /** Process confirmed dead - skip until mtime changes (file overwritten). */
+  dead: boolean;
+}
+const sessionFileCache = new Map<string, CachedSessionFile>();
+
+/** Clear the session-file cache (call when the projects dir config changes). */
+export function clearSessionFileCache(): void {
+  sessionFileCache.clear();
+}
+
+/**
+ * Read ~/.claude/sessions/<pid>.json - each file is one live Claude Code
  * process. Returns sessions whose owning process is still alive. This is the
  * authoritative source of "which sessions are currently open".
  */
@@ -562,34 +584,66 @@ export async function listActiveSessions(claudeDir?: string): Promise<ActiveSess
     return [];
   }
   const out: ActiveSession[] = [];
+  const seen = new Set<string>();
   for (const f of files) {
     const p = path.join(sessionsDir, f);
-    let obj: any;
+    seen.add(p);
+    let stat: fs.Stats;
     try {
-      const text = await fs.promises.readFile(p, "utf8");
-      obj = JSON.parse(text);
+      stat = await fs.promises.stat(p);
     } catch {
       continue;
     }
-    if (!obj || !obj.sessionId) {
+
+    // Reuse cached parse if the file hasn't changed (session files are
+    // write-once, so this avoids re-reading/parsing dead sessions every scan).
+    let entry = sessionFileCache.get(p);
+    if (!entry || entry.mtime !== stat.mtimeMs) {
+      let obj: any;
+      try {
+        obj = JSON.parse(await fs.promises.readFile(p, "utf8"));
+      } catch {
+        continue;
+      }
+      if (!obj || !obj.sessionId) continue;
+      entry = {
+        mtime: stat.mtimeMs,
+        pid: typeof obj.pid === "number" ? obj.pid : undefined,
+        sessionId: obj.sessionId,
+        cwd: obj.cwd,
+        startedAt: obj.startedAt,
+        dead: false,
+      };
+      sessionFileCache.set(p, entry);
+    }
+
+    // Skip sessions confirmed dead (until the file is overwritten).
+    if (entry.dead || entry.pid === undefined) continue;
+
+    // Liveness re-check: signal 0 throws if the process is gone. Cheap, so we
+    // do it every scan to detect newly-dead sessions.
+    try {
+      process.kill(entry.pid, 0);
+    } catch {
+      entry.dead = true;
       continue;
     }
-    // Liveness check: signal 0 throws if the process is gone.
-    if (typeof obj.pid === "number") {
-      try {
-        process.kill(obj.pid, 0);
-      } catch {
-        continue; // process dead — skip
-      }
-    }
-    const transcriptPath = await findTranscriptForSession(dir, obj.sessionId, obj.cwd);
+
+    const transcriptPath = await findTranscriptForSession(dir, entry.sessionId!, entry.cwd);
     out.push({
-      sessionId: obj.sessionId,
-      pid: obj.pid,
-      cwd: obj.cwd,
-      startedAt: obj.startedAt,
+      sessionId: entry.sessionId!,
+      pid: entry.pid,
+      cwd: entry.cwd,
+      startedAt: entry.startedAt,
       transcriptPath,
     });
+  }
+
+  // Prune cache entries for files that no longer exist.
+  if (sessionFileCache.size > seen.size + 20) {
+    for (const key of sessionFileCache.keys()) {
+      if (!seen.has(key)) sessionFileCache.delete(key);
+    }
   }
   return out;
 }

@@ -18,6 +18,7 @@ import {
   findTranscriptForSession,
   collectAllRequests,
   collectRequestsFromFile,
+  clearSessionFileCache,
   type SessionInfo,
   type ActiveSession,
   type StatRequest,
@@ -98,7 +99,7 @@ interface SessionView {
 
 class MonitorService implements vscode.Disposable {
   private dashboard: Dashboard;
-  private logTailer: LogTailer;
+  private logTailer: LogTailer | undefined;
 
   private claudeDir: string;
   private projectsDir: string;
@@ -144,9 +145,15 @@ class MonitorService implements vscode.Disposable {
     );
     this.claudeDir = path.dirname(this.projectsDir);
 
-    this.logTailer = new LogTailer(defaultCodeLogsDir());
-    this.disposables.push(this.logTailer);
-    this.logTailer.onState(() => this.scheduleTick());
+    // The log tailer is the most CPU-sensitive part (it parses the Claude Code
+    // extension log for live signals). It can be disabled via config if it
+    // causes UI lag during long sessions - the monitor then falls back to
+    // transcript-only inference (no live retry/TTFT signals).
+    if (getConfig().get<boolean>("enableLogTail") !== false) {
+      this.logTailer = new LogTailer(defaultCodeLogsDir());
+      this.disposables.push(this.logTailer);
+      this.logTailer.onState(() => this.scheduleTick());
+    }
 
     // When the dashboard panel is closed, release cached stats data to free memory.
     this.dashboard.onPanelClosed = () => {
@@ -168,6 +175,7 @@ class MonitorService implements vscode.Disposable {
           this.statsCache = undefined;
           this.modelsCache = undefined;
           this.cachedActiveSessionsAt = 0;
+          clearSessionFileCache();
         }
       })
     );
@@ -449,7 +457,9 @@ class MonitorService implements vscode.Disposable {
 
     const cfg = getConfig();
     const show = cfg.get<boolean>("showInStatusBar") !== false;
-    const logSummary = this.logTailer.getSummary();
+    const logSummary = this.logTailer
+      ? this.logTailer.getSummary()
+      : { available: false, sessions: new Map<string, PerSessionLogState>(), updatedAtMs: now };
 
     // Incrementally read all active session transcripts in parallel.
     const tickEntries = new Map<string, TranscriptEntry[]>();

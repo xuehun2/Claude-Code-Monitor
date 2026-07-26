@@ -71,6 +71,8 @@ export class LogTailer implements vscode.Disposable {
   private readonly codeLogsDir: string;
   /** Guard against concurrent checkFile runs. */
   private checking = false;
+  /** Debounce timer for fs.watch events - coalesces bursts into one check. */
+  private watchDebounce: NodeJS.Timeout | undefined;
 
   constructor(codeLogsDir: string) {
     this.codeLogsDir = codeLogsDir;
@@ -118,6 +120,18 @@ export class LogTailer implements vscode.Disposable {
   }
 
   private async findAndOpen(): Promise<void> {
+    // If we already have an active log file that's still being written, skip
+    // the directory rescan - findLatestLog stats every candidate log file
+    // across all sessions/windows, which is wasteful while the current log is
+    // fresh. Only rescan when the current log goes stale or disappears.
+    if (this.logPath && this.fd) {
+      try {
+        const st = await fs.promises.stat(this.logPath);
+        if (Date.now() - st.mtimeMs < 5 * 60 * 1000) return;
+      } catch {
+        // current log gone - fall through to rescan
+      }
+    }
     const found = await findLatestLog(this.codeLogsDir);
     if (!found) return;
     if (found === this.logPath) return;
@@ -127,7 +141,16 @@ export class LogTailer implements vscode.Disposable {
       this.fd = await fs.promises.open(found, "r");
       const stat = await fs.promises.stat(found);
       this.offset = stat.size;
-      this.watcher = fs.watch(found, () => void this.checkFile());
+      // Debounce fs.watch: on Windows, a rapidly-written log file fires many
+      // events. Coalesce them into a single check 200ms after the last event
+      // so a streaming burst doesn't flood the shared extension-host event loop.
+      this.watcher = fs.watch(found, () => {
+        if (this.watchDebounce) clearTimeout(this.watchDebounce);
+        this.watchDebounce = setTimeout(() => {
+          this.watchDebounce = undefined;
+          void this.checkFile();
+        }, 200);
+      });
       await this.replayTail(96_000);
       this.emit();
     } catch {
@@ -155,6 +178,10 @@ export class LogTailer implements vscode.Disposable {
       // ignore
     }
     this.watcher = undefined;
+    if (this.watchDebounce) {
+      clearTimeout(this.watchDebounce);
+      this.watchDebounce = undefined;
+    }
     try {
       await this.fd?.close();
     } catch {
@@ -186,10 +213,25 @@ export class LogTailer implements vscode.Disposable {
       if (size === this.offset) return;
       try {
         const len = size - this.offset;
-        const buf = Buffer.alloc(len);
-        await this.fd.read(buf, 0, len, this.offset);
+        // Bound the synchronous parse work per check. If a large burst of log
+        // data arrived (verbose streaming/tool output), read only the most
+        // recent chunk and skip the middle - this prevents a multi-MB parse
+        // from stalling the shared extension-host thread. The signals we care
+        // about (retry, first byte, running state) are the most recent ones.
+        const MAX_PARSE = 512 * 1024;
+        let readOff = this.offset;
+        let readLen = len;
+        let skipFirst = false;
+        if (len > MAX_PARSE) {
+          readOff = size - MAX_PARSE;
+          readLen = MAX_PARSE;
+          skipFirst = true; // first line is likely partial after skipping
+        }
+        const buf = Buffer.alloc(readLen);
+        await this.fd.read(buf, 0, readLen, readOff);
         this.offset = size;
-        this.parse(buf.toString("utf8"));
+        const text = buf.toString("utf8");
+        this.parse(skipFirst ? skipPartialFirstLine(text) : text);
         this.emit();
       } catch {
         // ignore
@@ -356,6 +398,9 @@ export class LogTailer implements vscode.Disposable {
     clearInterval(this.pollingTimer);
     if (this.rescanTimer) {
       clearInterval(this.rescanTimer);
+    }
+    if (this.watchDebounce) {
+      clearTimeout(this.watchDebounce);
     }
     void this.close();
   }

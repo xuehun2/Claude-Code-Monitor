@@ -2,7 +2,7 @@
   "name": "claude-monitor",
   "displayName": "Claude Monitor",
   "description": "🇨🇳 Claude Code 实时状态栏监控 | 🇬🇧 Real-time status bar monitor for Claude Code — model, context, rate, TTFT, retry detection, multi-session",
-  "version": "0.5.3",
+  "version": "0.5.4",
   "publisher": "xuehun",
   "license": "MIT",
   "repository": {
@@ -82,6 +82,11 @@
           "default": 40,
           "minimum": 5,
           "markdownDescription": "How many recent requests to keep for the dashboard sparkline / history table."
+        },
+        "claudeMonitor.enableLogTail": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Tail the Claude Code extension log for live signals (running/idle, retry detection, first-byte latency, session titles). Disable if the monitor causes UI lag during long sessions - the status bar will fall back to transcript-only inference (no live retry/TTFT signals)."
         }
       }
     }
