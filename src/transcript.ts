@@ -112,6 +112,12 @@ export interface IncrementalReadState {
   lastSize: number;
   /** Parsed entries accumulated so far (only the trailing maxEntries are kept). */
   entries: TranscriptEntry[];
+  /**
+   * How many entries have been dropped from the front of `entries` (sliding
+   * window). Tracked so the compute accumulator can stay in sync with the
+   * trimmed array - see `entryBaseOffset` in ComputeOptions.
+   */
+  droppedCount: number;
 }
 
 /**
@@ -135,7 +141,7 @@ export async function readEntriesIncremental(
   try {
     stat = await fs.promises.stat(p);
   } catch {
-    return prevState ?? { lastOffset: 0, lastSize: 0, entries: [] };
+    return prevState ?? { lastOffset: 0, lastSize: 0, entries: [], droppedCount: 0 };
   }
 
   const fileSize = stat.size;
@@ -147,6 +153,7 @@ export async function readEntriesIncremental(
       lastOffset: fileSize,
       lastSize: fileSize,
       entries: trimToMax(entries, maxEntries),
+      droppedCount: 0,
     };
   }
 
@@ -157,6 +164,7 @@ export async function readEntriesIncremental(
       lastOffset: fileSize,
       lastSize: fileSize,
       entries: trimToMax(entries, maxEntries),
+      droppedCount: 0,
     };
   }
 
@@ -174,11 +182,22 @@ export async function readEntriesIncremental(
     const { bytesRead } = await fd.read(buf, 0, newBytes, prevState.lastOffset);
     const text = buf.toString("utf8", 0, bytesRead);
     const newEntries = parseLines(text, true); // skipFirst=true: first line may be partial
-    const allEntries = [...prevState.entries, ...newEntries];
+    // Append in place (avoids copying the full entries array on every append)
+    // and trim the sliding window from the front, tracking how many were
+    // dropped so the compute accumulator stays in sync (entryBaseOffset).
+    const entries = prevState.entries;
+    for (const ne of newEntries) entries.push(ne);
+    let droppedCount = prevState.droppedCount ?? 0;
+    if (entries.length > maxEntries) {
+      const excess = entries.length - maxEntries;
+      entries.splice(0, excess);
+      droppedCount += excess;
+    }
     return {
       lastOffset: fileSize,
       lastSize: fileSize,
-      entries: trimToMax(allEntries, maxEntries),
+      entries,
+      droppedCount,
     };
   } catch {
     return prevState;
@@ -246,14 +265,45 @@ function trimToMax(entries: TranscriptEntry[], max: number): TranscriptEntry[] {
 }
 
 /**
- * Strip memory-heavy fields we don't need for monitoring. Assistant entries
- * carry the full message.content (tool results, large text blocks) which can
- * be hundreds of KB per entry. We keep only usage + stop_reason + model.
+ * Strip memory-heavy fields we don't need for monitoring. Both assistant and
+ * user entries carry message.content which can be hundreds of KB each:
+ *   - assistant: text blocks + tool_use input (e.g. full file-write content)
+ *   - user: tool_result output (e.g. entire file reads, bash output)
+ * For a long session, 500 retained entries with untrimmed content can hold
+ * 10-50MB+ in memory, creating GC pressure that stalls the shared extension
+ * host thread (and thus Claude Code's own streaming UI). We keep only a
+ * truncated error text for API-error user messages; everything else is dropped.
+ * Also drops top-level toolUseResult which can carry full tool output.
  */
 function trimHeavyFields(e: TranscriptEntry): void {
-  if (e.type !== "assistant" || !e.message) return;
-  const msg = e.message as { content?: unknown; usage?: unknown; model?: string; stop_reason?: string; role?: string };
-  msg.content = undefined;
+  if (e.message) {
+    if (e.isApiErrorMessage) {
+      const text = contentToText(e.message.content);
+      e.message.content = text ? text.slice(0, 200) : undefined;
+    } else {
+      e.message.content = undefined;
+    }
+  }
+  delete (e as Record<string, unknown>).toolUseResult;
+}
+
+/** Best-effort flatten of message.content into a short string (for error text). */
+function contentToText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((c) => {
+        if (typeof c === "string") return c;
+        if (c && typeof c === "object") {
+          const o = c as Record<string, unknown>;
+          if (typeof o.text === "string") return o.text;
+          if (typeof o.content === "string") return o.content;
+        }
+        return "";
+      })
+      .join(" ");
+  }
+  return "";
 }
 
 export function safeParse(line: string): TranscriptEntry | null {

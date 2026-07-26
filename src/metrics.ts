@@ -128,6 +128,12 @@ export interface ComputeOptions {
   retryThresholdMs: number;
   maxHistory: number;
   nowMs: number;
+  /**
+   * Number of entries dropped from the front of the entries array (sliding
+   * window in readEntriesIncremental). Used to keep this accumulator in sync
+   * with the trimmed array so incremental processing stays correct.
+   */
+  entryBaseOffset?: number;
 }
 
 /**
@@ -137,8 +143,10 @@ export interface ComputeOptions {
  * to do a full recomputation.
  */
 export interface ComputeAccumulator {
-  /** How many entries from the entries array have already been processed. */
+  /** How many entries (absolute, from the original start) have been processed. */
   processedCount: number;
+  /** Total request count. allRequests is bounded, so this tracks the true total. */
+  requestCount: number;
 
   // --- intermediate state carried across calls ---
   pendingStartMs: number | undefined;
@@ -177,11 +185,20 @@ function num(n: unknown): number {
 }
 
 /**
+ * Cap on how many RequestRecords the accumulator retains. Only the most recent
+ * `maxHistory` (default 40) are shown in the dashboard; we keep a little extra
+ * margin. The true total is tracked by `requestCount` so trimming this array
+ * does not lose the count. Bounds memory in very long sessions.
+ */
+const MAX_ACC_REQUESTS = 100;
+
+/**
  * Create a fresh (empty) accumulator.
  */
 function freshAccumulator(): ComputeAccumulator {
   return {
     processedCount: 0,
+    requestCount: 0,
     pendingStartMs: undefined,
     lastUserMs: undefined,
     lastErrorText: undefined,
@@ -282,9 +299,15 @@ function processEntries(
           stopReason: e.message.stop_reason,
         };
         acc.allRequests.push(req);
+        acc.requestCount++;
         acc.totalOutputTokens += outputTokens;
         acc.totalInputTokens += contextTokens;
         acc.pendingStartMs = undefined; // consumed
+        // Bound the retained request history so allRequests cannot grow
+        // unboundedly in very long sessions. requestCount keeps the true total.
+        if (acc.allRequests.length > MAX_ACC_REQUESTS) {
+          acc.allRequests.splice(0, acc.allRequests.length - MAX_ACC_REQUESTS);
+        }
       }
       continue;
     }
@@ -297,7 +320,9 @@ function processEntries(
     }
   }
 
-  acc.processedCount = endIdx;
+  // Note: processedCount (absolute) is set by the caller, which knows the
+  // entryBaseOffset (sliding-window drop count). processEntries only ever
+  // processes to the end of the array it's given.
   return acc;
 }
 
@@ -313,7 +338,7 @@ function buildState(acc: ComputeAccumulator, entries: TranscriptEntry[], opts: C
     contextLimit: opts.contextLimit,
     contextPct: 0,
     requests: [],
-    requestCount: acc.allRequests.length,
+    requestCount: acc.requestCount,
     totalOutputTokens: acc.totalOutputTokens,
     totalInputTokens: acc.totalInputTokens,
     inFlight: false,
@@ -417,20 +442,31 @@ export function computeStateIncremental(
     return { state, acc };
   }
 
-  // Determine if we can do an incremental update.
-  // If prevAcc exists and its processedCount <= entries.length, we only
-  // need to process entries from processedCount onward.
-  // If processedCount > entries.length, the entries array was replaced
-  // (truncation/re-read) — do a full recomputation.
+  // Determine if we can do an incremental update. The entries array is a
+  // sliding window: readEntriesIncremental drops old entries from the front
+  // once maxEntries is exceeded, tracking how many were dropped in
+  // `droppedCount` (passed here as opts.entryBaseOffset). So the entry at
+  // index i in the current array is absolute index (base + i); the
+  // accumulator's processedCount is absolute, so the first unprocessed entry
+  // in the current array is at relative index (processedCount - base). If that
+  // is within [0, entries.length] we process just the new tail; otherwise the
+  // array was replaced or the accumulator is stale, so recompute from index 0.
+  const base = opts.entryBaseOffset ?? 0;
   let acc: ComputeAccumulator;
   let startIdx: number;
 
-  if (prevAcc && prevAcc.processedCount <= entries.length) {
-    // Incremental: reuse previous accumulator, process only new entries.
-    acc = prevAcc;
-    startIdx = acc.processedCount;
+  if (prevAcc) {
+    const rel = prevAcc.processedCount - base;
+    if (rel >= 0 && rel <= entries.length) {
+      // Incremental: reuse previous accumulator, process only new entries.
+      acc = prevAcc;
+      startIdx = rel;
+    } else {
+      // Full recomputation: start fresh.
+      acc = freshAccumulator();
+      startIdx = 0;
+    }
   } else {
-    // Full recomputation: start fresh.
     acc = freshAccumulator();
     startIdx = 0;
   }
@@ -439,6 +475,9 @@ export function computeStateIncremental(
   if (startIdx < entries.length) {
     processEntries(acc, entries, startIdx, entries.length);
   }
+  // Absolute processed count: the current array covers absolute indices
+  // [base, base + entries.length).
+  acc.processedCount = base + entries.length;
 
   const state = buildState(acc, entries, opts);
   return { state, acc };

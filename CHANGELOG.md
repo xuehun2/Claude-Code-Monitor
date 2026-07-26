@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.3 (2026-07-27)
+
+### 🚀 内存与性能优化（长会话卡顿修复）
+
+修复长会话场景下插件内存占用过高、导致 Claude Code 流式渲染卡顿的问题。根因：所有 VS Code 扩展共享同一个扩展宿主进程（单线程），插件持有的内存越多 → GC 压力越大 → GC 暂停会阻塞同线程的 Claude Code 扩展 → 流式输出卡顿。
+
+- **裁剪 user 消息内容（内存主因）** - `trimHeavyFields` 之前只裁剪 assistant 消息的 `content`，user 消息保留了完整内容。但 Claude Code transcript 中最大的条目恰恰是 user 消息：每次工具调用（文件读取、bash 命令）的结果都作为 `tool_result` 写在 user 消息的 `message.content` 里，单条可达 100KB-1MB。500 条 entries 中若有 100 条工具结果，就是 10-50MB 常驻内存。现在对所有条目裁剪 `content`（仅 API 错误消息保留 200 字符截断文本用于展示），并移除 `toolUseResult` 字段。每会话常驻内存从 10-50MB 降至约 150KB
+- **限制请求历史数组增长（内存泄漏）** - accumulator 的 `allRequests` 数组每完成一个请求就 push、从不裁剪，长会话（几千个请求）下持续增长永不释放。现在新增独立 `requestCount` 计数器跟踪真实总数，`allRequests` 裁剪保留最近 100 条（展示只需最近 40 条），既不丢失总数又限制内存
+- **修复滑动窗口裁剪导致增量计算失效（正确性）** - entries 超过 500 条触发滑动窗口裁剪时，旧代码产生新数组但 accumulator 的 `processedCount` 未相应调整，导致新条目被跳过不处理、监控数据变陈旧。现在 `IncrementalReadState` 跟踪 `droppedCount`（前端裁剪数），通过 `entryBaseOffset` 传给 `computeStateIncremental`，正确换算绝对/相对索引，增量计算在滑动窗口下仍准确
+- **避免每次 append 全量拷贝** - `readEntriesIncremental` 改为原地 push + splice 裁剪，避免每次新条目到达时 `[...500个元素]` 的全数组拷贝
+
 ## 0.5.2 (2026-07-26)
 
 ### 🐛 Bug 修复

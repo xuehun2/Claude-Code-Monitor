@@ -480,6 +480,7 @@ class MonitorService implements vscode.Disposable {
         retryThresholdMs: cfg.get<number>("retryThresholdMs") ?? 30000,
         maxHistory: cfg.get<number>("maxHistoryRequests") ?? 40,
         nowMs: now,
+        entryBaseOffset: v.readState?.droppedCount ?? 0,
       });
       v.computeAcc = acc;
       state.transcriptPath = v.active.transcriptPath;
